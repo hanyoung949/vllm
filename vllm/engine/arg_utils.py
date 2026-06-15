@@ -496,6 +496,13 @@ class EngineArgs:
     expert_placement_strategy: ExpertPlacementStrategy = (
         ParallelConfig.expert_placement_strategy
     )
+    enable_layerwise_split: bool = ParallelConfig.enable_layerwise_split
+    split_stage: str | None = ParallelConfig.split_stage
+    split_stage_0_size: int = ParallelConfig.split_stage_0_size
+    split_stage_2_size: int = ParallelConfig.split_stage_2_size
+    split_stage_1_tensor_parallel_size: int = (
+        ParallelConfig.split_stage_1_tensor_parallel_size
+    )
     _api_process_count: int = ParallelConfig._api_process_count
     _api_process_rank: int = ParallelConfig._api_process_rank
     max_parallel_loading_workers: int | None = (
@@ -1095,6 +1102,23 @@ class EngineArgs:
         parallel_group.add_argument(
             "--expert-placement-strategy",
             **parallel_kwargs["expert_placement_strategy"],
+        )
+        parallel_group.add_argument(
+            "--enable-layerwise-split",
+            **parallel_kwargs["enable_layerwise_split"],
+        )
+        parallel_group.add_argument(
+            "--split-stage", **parallel_kwargs["split_stage"]
+        )
+        parallel_group.add_argument(
+            "--split-stage-0-size", **parallel_kwargs["split_stage_0_size"]
+        )
+        parallel_group.add_argument(
+            "--split-stage-2-size", **parallel_kwargs["split_stage_2_size"]
+        )
+        parallel_group.add_argument(
+            "--split-stage-1-tensor-parallel-size",
+            **parallel_kwargs["split_stage_1_tensor_parallel_size"],
         )
 
         parallel_group.add_argument(
@@ -1990,6 +2014,11 @@ class EngineArgs:
             enable_eplb=self.enable_eplb,
             eplb_config=self.eplb_config,
             expert_placement_strategy=self.expert_placement_strategy,
+            enable_layerwise_split=self.enable_layerwise_split,
+            split_stage=self.split_stage,
+            split_stage_0_size=self.split_stage_0_size,
+            split_stage_2_size=self.split_stage_2_size,
+            split_stage_1_tensor_parallel_size=self.split_stage_1_tensor_parallel_size,
             max_parallel_loading_workers=self.max_parallel_loading_workers,
             disable_custom_all_reduce=self.disable_custom_all_reduce,
             ray_workers_use_nsight=self.ray_workers_use_nsight,

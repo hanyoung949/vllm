@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Union
 
 import numpy as np
 
+import vllm.envs as envs
 import vllm.platforms
 from vllm.config import ParallelConfig
 from vllm.distributed import get_pp_group
@@ -339,7 +340,9 @@ def build_actor_name(
     pcp_size: int,
 ) -> str:
     """Build a descriptive Ray actor name for dashboard visibility."""
-    name = f"vllm_Worker_{instance_id}"
+    # Always include the global rank so asymmetric layouts (e.g. layer-wise
+    # split with stage_1 tensor parallelism) cannot produce duplicate names.
+    name = f"vllm_Worker_{instance_id}_R{rank}"
     if tp_size > 1:
         name += f"_TP{rank % tp_size}"
     if pp_size > 1:
@@ -347,6 +350,81 @@ def build_actor_name(
     if pcp_size > 1:
         name += f"_PCP{rank // (tp_size * pp_size)}"
     return name
+
+
+def _parse_split_stage_node_map(raw: str) -> dict[str, str]:
+    """Parse VLLM_SPLIT_STAGE_NODE_MAP into a stage -> node-IP mapping.
+
+    Expected format: ``stage_0:<ip>,stage_1:<ip>,stage_2:<ip>``.
+    """
+    stage_map: dict[str, str] = {}
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" not in part:
+            raise ValueError(
+                f"Invalid VLLM_SPLIT_STAGE_NODE_MAP entry '{part}'. "
+                "Expected format: stage_0:<ip>,stage_1:<ip>,stage_2:<ip>"
+            )
+        stage, ip = part.split(":", 1)
+        stage = stage.strip().lower()
+        ip = ip.strip()
+        if stage not in ("stage_0", "stage_1", "stage_2"):
+            raise ValueError(
+                f"Invalid stage '{stage}' in VLLM_SPLIT_STAGE_NODE_MAP. "
+                "Valid stages are stage_0, stage_1, stage_2."
+            )
+        stage_map[stage] = ip
+    return stage_map
+
+
+def _get_stage_for_split_rank(rank: int, stage_1_tp_size: int) -> str:
+    replica_size = 1 + stage_1_tp_size + 1
+    rank_in_replica = rank % replica_size
+    if rank_in_replica == 0:
+        return "stage_0"
+    if rank_in_replica < 1 + stage_1_tp_size:
+        return "stage_1"
+    return "stage_2"
+
+
+def get_split_stage_bundle_assignment(
+    bundle_to_node_id: list[tuple[int, str, str]],
+    stage_1_tp_size: int,
+    split_stage_node_map: dict[str, str],
+) -> list[tuple[int, str, str]]:
+    """Reorder bundle assignments so each split stage lands on its target node.
+
+    ``bundle_to_node_id`` is assumed to be in bundle-index order (i.e. rank
+    order). The returned list assigns ranks in the split topology to bundles
+    that reside on the node specified by ``split_stage_node_map``.
+    """
+    from collections import defaultdict
+
+    node_to_bundles: dict[str, list[tuple[int, str, str]]] = defaultdict(list)
+    for item in bundle_to_node_id:
+        _, _, node_ip = item
+        node_to_bundles[node_ip].append(item)
+
+    assignment: list[tuple[int, str, str]] = []
+    for rank in range(len(bundle_to_node_id)):
+        stage = _get_stage_for_split_rank(rank, stage_1_tp_size)
+        target_ip = split_stage_node_map.get(stage)
+        if target_ip is None:
+            raise ValueError(
+                f"VLLM_SPLIT_STAGE_NODE_MAP missing stage '{stage}'. "
+                "Expected format: stage_0:<ip>,stage_1:<ip>,stage_2:<ip>"
+            )
+        if not node_to_bundles[target_ip]:
+            raise ValueError(
+                f"No available Ray bundle on node {target_ip} for stage {stage}. "
+                f"Requested map: {split_stage_node_map}. "
+                f"Available bundles: {dict(node_to_bundles)}."
+            )
+        assignment.append(node_to_bundles[target_ip].pop(0))
+
+    return assignment
 
 
 def get_bundles_for_indices(
@@ -657,9 +735,35 @@ def initialize_ray_cluster(
             # current node.
             placement_group_specs[0][f"node:{current_ip}"] = 0.001
 
-        # By default, Ray packs resources as much as possible.
+        # For layer-wise split with stage_1 tensor parallelism, optionally pin each
+        # rank to a specific node so that stage_1 TP ranks are co-located.
+        if (
+            parallel_config.enable_layerwise_split
+            and parallel_config.split_stage_1_tensor_parallel_size > 1
+            and envs.VLLM_SPLIT_STAGE_NODE_MAP is not None
+        ):
+            split_stage_node_map = _parse_split_stage_node_map(
+                envs.VLLM_SPLIT_STAGE_NODE_MAP
+            )
+            stage_1_tp_size = parallel_config.split_stage_1_tensor_parallel_size
+            for rank in range(parallel_config.world_size):
+                stage = _get_stage_for_split_rank(rank, stage_1_tp_size)
+                target_ip = split_stage_node_map.get(stage)
+                if target_ip is None:
+                    raise ValueError(
+                        f"VLLM_SPLIT_STAGE_NODE_MAP missing stage '{stage}'. "
+                        "Expected format: stage_0:<ip>,stage_1:<ip>,stage_2:<ip>"
+                    )
+                placement_group_specs[rank][f"node:{target_ip}"] = 0.001
+            logger.info(
+                "Layer-wise split placement group specs with stage-node map: %s",
+                placement_group_specs,
+            )
+
+        # Use SPREAD so pipeline-parallel ranks are placed across nodes when
+        # possible, which is required for cross-node layer-wise split.
         current_placement_group = ray.util.placement_group(
-            placement_group_specs, strategy="PACK"
+            placement_group_specs, strategy="SPREAD"
         )
         _wait_until_pg_ready(current_placement_group)
 

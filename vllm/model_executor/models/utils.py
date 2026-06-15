@@ -13,7 +13,7 @@ import torch.nn as nn
 from torch.nn.modules.module import register_module_module_registration_hook
 from transformers import PretrainedConfig
 
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, get_current_vllm_config_or_none
 from vllm.distributed import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
@@ -629,13 +629,53 @@ class PPMissingLayer(torch.nn.Identity):
         return args[0] if args else next(iter(kwargs.values()))
 
 
+def _get_split_layer_range(
+    num_hidden_layers: int,
+    split_stage: str,
+    split_stage_0_size: int,
+    split_stage_2_size: int,
+) -> tuple[int, int]:
+    """Compute the [start_layer, end_layer) range for a layer-wise split stage.
+
+    Args:
+        num_hidden_layers: Total number of hidden layers in the model.
+        split_stage: One of "stage_0", "stage_1", "stage_2".
+        split_stage_0_size: Number of layers on the stage_0.
+        split_stage_2_size: Number of layers on the stage_2.
+
+    Returns:
+        Tuple of (start_layer, end_layer).
+    """
+    if split_stage == "stage_0":
+        start_layer = 0
+        end_layer = split_stage_0_size
+    elif split_stage == "stage_1":
+        start_layer = split_stage_0_size
+        end_layer = num_hidden_layers - split_stage_2_size
+    elif split_stage == "stage_2":
+        start_layer = num_hidden_layers - split_stage_2_size
+        end_layer = num_hidden_layers
+    else:
+        raise ValueError(f"Unknown split_stage: {split_stage}")
+
+    if not (0 <= start_layer < end_layer <= num_hidden_layers):
+        raise ValueError(
+            f"Invalid split layer range for stage {split_stage}: "
+            f"[{start_layer}, {end_layer}) with "
+            f"num_hidden_layers={num_hidden_layers}, "
+            f"split_stage_0_size={split_stage_0_size}, "
+            f"split_stage_2_size={split_stage_2_size}."
+        )
+    return start_layer, end_layer
+
+
 def make_layers(
     num_hidden_layers: int,
     layer_fn: LayerFn,
     prefix: str,
 ) -> tuple[int, int, torch.nn.ModuleList]:
     """Make a list of layers with the given layer function, taking
-    pipeline parallelism into account.
+    pipeline parallelism and layer-wise split into account.
 
     Args:
         num_hidden_layers: Total number of hidden layers in the model.
@@ -649,9 +689,34 @@ def make_layers(
     from vllm.distributed.utils import get_pp_indices
     from vllm.model_executor.offloader import get_offloader
 
-    start_layer, end_layer = get_pp_indices(
-        num_hidden_layers, get_pp_group().rank_in_group, get_pp_group().world_size
-    )
+    vllm_config = get_current_vllm_config_or_none()
+    if (
+        vllm_config is not None
+        and vllm_config.parallel_config.enable_layerwise_split
+    ):
+        parallel_config = vllm_config.parallel_config
+        split_stage = parallel_config.split_stage
+        if split_stage is None:
+            # Derive stage from the split pipeline group.
+            pp_group = get_pp_group()
+            if pp_group.is_first_rank:
+                split_stage = "stage_0"
+            elif pp_group.is_last_rank:
+                split_stage = "stage_2"
+            else:
+                split_stage = "stage_1"
+        start_layer, end_layer = _get_split_layer_range(
+            num_hidden_layers,
+            split_stage,
+            parallel_config.split_stage_0_size,
+            parallel_config.split_stage_2_size,
+        )
+    else:
+        start_layer, end_layer = get_pp_indices(
+            num_hidden_layers,
+            get_pp_group().rank_in_group,
+            get_pp_group().world_size,
+        )
 
     modules = torch.nn.ModuleList(
         [PPMissingLayer() for _ in range(start_layer)]
@@ -662,6 +727,32 @@ def make_layers(
     )
 
     return start_layer, end_layer, modules
+
+
+def is_first_stage(split_stage: str | None = None) -> bool:
+    """Return True if this is the first stage of the pipeline.
+
+    In layer-wise split mode, the first stage is always stage_0. In native PP mode,
+    it falls back to the PP group's first rank check.
+    """
+    if split_stage is not None:
+        return split_stage == "stage_0"
+    from vllm.distributed.parallel_state import get_pp_group
+
+    return get_pp_group().is_first_rank
+
+
+def is_last_stage(split_stage: str | None = None) -> bool:
+    """Return True if this is the last stage of the pipeline.
+
+    In layer-wise split mode, the last stage is always stage_2. In native PP mode,
+    it falls back to the PP group's last rank check.
+    """
+    if split_stage is not None:
+        return split_stage == "stage_2"
+    from vllm.distributed.parallel_state import get_pp_group
+
+    return get_pp_group().is_last_rank
 
 
 # NOTE: don't use lru_cache here because it can prevent garbage collection

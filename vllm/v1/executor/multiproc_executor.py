@@ -115,12 +115,23 @@ class MultiprocExecutor(Executor):
         self.failure_callback: FailureCallback | None = None
 
         tp_size, pp_size, pcp_size = self._get_parallel_sizes()
-        assert self.world_size == tp_size * pp_size * pcp_size, (
-            f"world_size ({self.world_size}) must be equal to the "
-            f"tensor_parallel_size ({tp_size}) x pipeline"
-            f"_parallel_size ({pp_size}) x prefill_context"
-            f"_parallel_size ({pcp_size}). "
-        )
+        if self.parallel_config.enable_layerwise_split:
+            expected_world_size = (
+                1 + self.parallel_config.split_stage_1_tensor_parallel_size + 1
+            ) * pcp_size
+            assert self.world_size == expected_world_size, (
+                f"world_size ({self.world_size}) must be equal to "
+                f"1 + split_stage_1_tensor_parallel_size "
+                f"({self.parallel_config.split_stage_1_tensor_parallel_size}) + 1 "
+                f"for layer-wise split. expected={expected_world_size}"
+            )
+        else:
+            assert self.world_size == tp_size * pp_size * pcp_size, (
+                f"world_size ({self.world_size}) must be equal to the "
+                f"tensor_parallel_size ({tp_size}) x pipeline"
+                f"_parallel_size ({pp_size}) x prefill_context"
+                f"_parallel_size ({pcp_size}). "
+            )
 
         set_multiprocessing_worker_envs()
 
@@ -263,6 +274,11 @@ class MultiprocExecutor(Executor):
         pass
 
     def _is_driver_worker(self, rank: int) -> bool:
+        if self.parallel_config.enable_layerwise_split:
+            # In split mode the stage_0 rank (global rank 0 within the DP replica)
+            # is the driver worker.
+            replica_size = 1 + self.parallel_config.split_stage_1_tensor_parallel_size + 1
+            return rank % replica_size == 0
         return rank % self.parallel_config.tensor_parallel_size == 0
 
     def start_worker_monitor(self, inline=False) -> None:
@@ -493,6 +509,10 @@ class MultiprocExecutor(Executor):
         return
 
     def _get_output_rank(self) -> int:
+        if self.parallel_config.enable_layerwise_split:
+            # Output is produced by stage_2, the last rank of each split replica.
+            replica_size = 1 + self.parallel_config.split_stage_1_tensor_parallel_size + 1
+            return self.world_size - 1
         # Only returns ModelRunnerOutput from TP rank=0 and PP rank=-1
         # (the first TP worker of the last PP stage).
         # Example:

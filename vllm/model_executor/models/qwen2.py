@@ -73,6 +73,8 @@ from .utils import (
     AutoWeightsLoader,
     PPMissingLayer,
     extract_layer_index,
+    is_first_stage,
+    is_last_stage,
     is_pp_missing_parameter,
     make_empty_intermediate_tensors_factory,
     make_layers,
@@ -351,9 +353,18 @@ class Qwen2Model(nn.Module, EagleModelMixin):
         self.config = config
         self.quant_config = quant_config
         self.vocab_size = config.vocab_size
+        self.split_stage = (
+            vllm_config.parallel_config.split_stage
+            if vllm_config.parallel_config.enable_layerwise_split
+            else None
+        )
+        # When layer-wise split is enabled but no explicit stage is given, the
+        # stage is derived from the pipeline-parallel group (created by
+        # initialize_model_parallel).  The is_first_stage/is_last_stage helpers
+        # will fall back to the PP group in that case.
 
-        if get_pp_group().is_first_rank or (
-            config.tie_word_embeddings and get_pp_group().is_last_rank
+        if is_first_stage(self.split_stage) or (
+            config.tie_word_embeddings and is_last_stage(self.split_stage)
         ):
             self.embed_tokens = VocabParallelEmbedding(
                 config.vocab_size,
@@ -378,7 +389,7 @@ class Qwen2Model(nn.Module, EagleModelMixin):
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
-        if get_pp_group().is_last_rank:
+        if is_last_stage(self.split_stage):
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
@@ -393,7 +404,7 @@ class Qwen2Model(nn.Module, EagleModelMixin):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
-        if get_pp_group().is_first_rank:
+        if is_first_stage(self.split_stage):
             if inputs_embeds is not None:
                 hidden_states = inputs_embeds
             else:
@@ -413,7 +424,7 @@ class Qwen2Model(nn.Module, EagleModelMixin):
                 aux_hidden_states, idx + 1, hidden_states, residual
             )
 
-        if not get_pp_group().is_last_rank:
+        if not is_last_stage(self.split_stage):
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
@@ -506,7 +517,7 @@ class Qwen2ForCausalLM(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
 
-        if get_pp_group().is_last_rank:
+        if is_last_stage(self.model.split_stage):
             if config.tie_word_embeddings:
                 self.lm_head = self.model.embed_tokens
             else:

@@ -49,6 +49,10 @@ if TYPE_CHECKING:
     VLLM_TRACE_FUNCTION: int = 0
     VLLM_USE_FLASHINFER_SAMPLER: bool = True
     VLLM_PP_LAYER_PARTITION: str | None = None
+    VLLM_SPLIT_TENSOR_RECV_ADDRS: str | None = None
+    VLLM_SPLIT_TOKEN_RECV_ADDRS: str | None = None
+    VLLM_SPLIT_ENDPOINT_REGISTRY_NAME: str | None = None
+    VLLM_SPLIT_STAGE_NODE_MAP: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
     VLLM_CPU_OMP_THREADS_BIND: str = "auto"
     VLLM_CPU_NUM_OF_RESERVED_CPU: int | None = None
@@ -828,6 +832,24 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Pipeline stage partition strategy
     "VLLM_PP_LAYER_PARTITION": lambda: os.getenv("VLLM_PP_LAYER_PARTITION", None),
+    # Comma-separated ZMQ receive addresses for layer-wise split stages.
+    "VLLM_SPLIT_TENSOR_RECV_ADDRS": lambda: os.getenv(
+        "VLLM_SPLIT_TENSOR_RECV_ADDRS", None
+    ),
+    # Comma-separated ZMQ receive addresses for sampled token broadcast from stage_2.
+    "VLLM_SPLIT_TOKEN_RECV_ADDRS": lambda: os.getenv(
+        "VLLM_SPLIT_TOKEN_RECV_ADDRS", None
+    ),
+    # Ray actor name for layer-wise split endpoint auto-discovery.
+    "VLLM_SPLIT_ENDPOINT_REGISTRY_NAME": lambda: os.getenv(
+        "VLLM_SPLIT_ENDPOINT_REGISTRY_NAME", None
+    ),
+    # Optional stage-to-node IP map for layer-wise split with stage_1 tensor
+    # parallelism. Format: "stage_0:<ip>,stage_1:<ip>,stage_2:<ip>". Used by the Ray
+    # executor to ensure stage_1 TP ranks land on the same node.
+    "VLLM_SPLIT_STAGE_NODE_MAP": lambda: os.getenv(
+        "VLLM_SPLIT_STAGE_NODE_MAP", None
+    ),
     # (CPU backend only) CPU key-value cache space.
     # default is None and will be set as 4 GB
     "VLLM_CPU_KVCACHE_SPACE": lambda: (

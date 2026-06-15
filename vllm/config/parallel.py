@@ -52,6 +52,8 @@ All2AllBackend = Literal[
     "flashinfer_nvlink_one_sided",
 ]
 
+SplitStage = Literal["stage_0", "stage_1", "stage_2"]
+
 
 @config
 class EPLBConfig:
@@ -193,6 +195,25 @@ class ParallelConfig:
     - "nixl_ep": Use nixl-ep kernels
     - "flashinfer_nvlink_two_sided": Use flashinfer two-sided kernels for mnnvl
     - "flashinfer_nvlink_one_sided": Use flashinfer high-throughput a2a kernels"""
+
+    enable_layerwise_split: bool = False
+    """Enable layer-wise split (stage_0 -> stage_1 -> stage_2). When disabled,
+    all split-related settings are ignored and vLLM behaves exactly as before."""
+
+    split_stage: SplitStage | None = None
+    """Role of this process in layer-wise split: stage_0 (Edge Head), stage_1 (Cloud Body),
+    or stage_2 (Edge Tail). Required when enable_layerwise_split is True."""
+
+    split_stage_0_size: int = Field(default=0, ge=0)
+    """Number of layers assigned to stage_0 (Edge Head)."""
+
+    split_stage_2_size: int = Field(default=0, ge=0)
+    """Number of layers assigned to stage_2 (Edge Tail)."""
+
+    split_stage_1_tensor_parallel_size: int = Field(default=1, ge=1)
+    """Tensor-parallel size of stage_1 (Cloud Body) in layer-wise split.
+    stage_0 and stage_2 are always single-GPU (TP=1).  Total GPU count for split mode
+    is 1 + split_stage_1_tensor_parallel_size + 1."""
 
     max_parallel_loading_workers: int | None = Field(default=None, ge=1)
     """Maximum number of parallel loading workers when loading model
@@ -503,6 +524,42 @@ class ParallelConfig:
                 "dcp_comm_backend='a2a' requires decode_context_parallel_size > 1."
             )
 
+        if self.enable_layerwise_split:
+            if self.split_stage_0_size <= 0:
+                raise ValueError(
+                    "split_stage_0_size must be positive when enable_layerwise_split "
+                    "is True."
+                )
+            if self.split_stage_2_size <= 0:
+                raise ValueError(
+                    "split_stage_2_size must be positive when enable_layerwise_split "
+                    "is True."
+                )
+            if self.pipeline_parallel_size not in (1, 3):
+                raise ValueError(
+                    "pipeline_parallel_size must be 1 (test/local) or 3 "
+                    "(runtime) when enable_layerwise_split is True (stage_0/stage_1/stage_2)."
+                )
+            if self.tensor_parallel_size != 1:
+                raise ValueError(
+                    "tensor_parallel_size must be 1 when enable_layerwise_split "
+                    "is True (stage_1 TP size is controlled by "
+                    "split_stage_1_tensor_parallel_size)."
+                )
+            if self.split_stage_1_tensor_parallel_size < 1:
+                raise ValueError(
+                    "split_stage_1_tensor_parallel_size must be >= 1 when "
+                    "enable_layerwise_split is True."
+                )
+            if self.split_stage is not None:
+                # Role will be validated against PP rank at runtime.
+                pass
+        else:
+            if self.split_stage is not None:
+                raise ValueError(
+                    "split_stage must be None when enable_layerwise_split is False."
+                )
+
         return self
 
     @property
@@ -781,11 +838,17 @@ class ParallelConfig:
 
     def __post_init__(self) -> None:
         # Continue with the rest of the initialization
-        self.world_size = (
-            self.pipeline_parallel_size
-            * self.tensor_parallel_size
-            * self.prefill_context_parallel_size
-        )
+        if self.enable_layerwise_split:
+            # Layer-wise split uses an asymmetric topology: stage_0=1, stage_1=TP-N, stage_2=1.
+            self.world_size = (
+                1 + self.split_stage_1_tensor_parallel_size + 1
+            ) * self.prefill_context_parallel_size
+        else:
+            self.world_size = (
+                self.pipeline_parallel_size
+                * self.tensor_parallel_size
+                * self.prefill_context_parallel_size
+            )
 
         if self.distributed_executor_backend == "external_launcher":
             logger.info("Using external launcher for distributed inference.")

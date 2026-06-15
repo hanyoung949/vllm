@@ -20,6 +20,9 @@ from vllm.utils.network_utils import (
     get_distributed_init_method,
     get_open_port,
 )
+from vllm.v1.engine.split_endpoint_registry import (
+    create_split_endpoint_registry,
+)
 from vllm.v1.executor.multiproc_executor import (
     FutureWrapper,
     MultiprocExecutor,
@@ -224,11 +227,39 @@ class RayExecutorV2(MultiprocExecutor):
         Driver env vars are applied separately via initialize_worker
         with setdefault semantics.
         """
+        import vllm
+
         base = self.parallel_config.ray_runtime_env
         runtime_env: dict = copy.deepcopy(dict(base)) if base else {}
 
         env_vars = runtime_env.setdefault("env_vars", {})
         env_vars.update({v: "1" for v in current_platform.ray_noset_device_env_vars})
+
+        # Propagate NCCL network-selection variables so that workers on all
+        # nodes use the same physical interface as the driver.  These are
+        # critical for cross-node layer-wise split where NCCL must not pick a
+        # Docker bridge interface.
+        for nccl_var in (
+            "NCCL_SOCKET_IFNAME",
+            "NCCL_IB_DISABLE",
+            "NCCL_NET",
+            "NCCL_P2P_DISABLE",
+        ):
+            value = os.environ.get(nccl_var)
+            if value is not None:
+                env_vars[nccl_var] = value
+
+        # Ensure workers can find the vLLM package root even when the worker
+        # process starts in a directory where /root/workspace/vllm would be
+        # interpreted as a namespace package.
+        vllm_package_root = os.path.dirname(os.path.dirname(vllm.__file__))
+        existing_pythonpath = env_vars.get("PYTHONPATH", os.environ.get("PYTHONPATH", ""))
+        env_vars["PYTHONPATH"] = (
+            f"{vllm_package_root}{os.pathsep}{existing_pythonpath}"
+            if existing_pythonpath
+            else vllm_package_root
+        )
+
         if self.parallel_config.ray_workers_use_nsight:
             runtime_env["nsight"] = {
                 "t": "cuda,cudnn,cublas",
@@ -261,19 +292,62 @@ class RayExecutorV2(MultiprocExecutor):
         placement_group = self.parallel_config.placement_group
 
         tp_size, pp_size, pcp_size = self._get_parallel_sizes()
-        assert self.world_size == tp_size * pp_size * pcp_size, (
-            f"world_size ({self.world_size}) must be equal to the "
-            f"tensor_parallel_size ({tp_size}) x pipeline"
-            f"_parallel_size ({pp_size}) x prefill_context"
-            f"_parallel_size ({pcp_size}). "
-        )
+        if self.parallel_config.enable_layerwise_split:
+            expected_world_size = (
+                1 + self.parallel_config.split_stage_1_tensor_parallel_size + 1
+            ) * pcp_size
+            assert self.world_size == expected_world_size, (
+                f"world_size ({self.world_size}) must be equal to "
+                f"1 + split_stage_1_tensor_parallel_size "
+                f"({self.parallel_config.split_stage_1_tensor_parallel_size}) + 1 "
+                f"for layer-wise split. expected={expected_world_size}"
+            )
+        else:
+            assert self.world_size == tp_size * pp_size * pcp_size, (
+                f"world_size ({self.world_size}) must be equal to the "
+                f"tensor_parallel_size ({tp_size}) x pipeline"
+                f"_parallel_size ({pp_size}) x prefill_context"
+                f"_parallel_size ({pcp_size}). "
+            )
 
-        # Step 2: Build bundle assignments for worker rank placement
-        # while respecting VLLM_RAY_BUNDLE_INDICES.
+        # Step 1b: Create a split endpoint registry for layer-wise split
+        # auto-discovery when addresses are not provided manually.
+        self._split_endpoint_registry: Any | None = None
+        if (
+            self.parallel_config.enable_layerwise_split
+            and pp_size > 1
+            and not envs.VLLM_SPLIT_TENSOR_RECV_ADDRS
+        ):
+            self._split_endpoint_registry, registry_name = (
+                create_split_endpoint_registry(
+                    self.vllm_config.instance_id, pp_size
+                )
+            )
+            os.environ["VLLM_SPLIT_ENDPOINT_REGISTRY_NAME"] = registry_name
+            logger.info(
+                "Created SplitEndpointRegistry actor for split auto-discovery: %s",
+                registry_name,
+            )
+
+        # Step 2: Build bundle assignments for worker rank placement.
+        # Respect VLLM_RAY_BUNDLE_INDICES first, then a stage-to-node map for
+        # layer-wise split with stage_1 TP, then the default driver-first sort.
         if envs.VLLM_RAY_BUNDLE_INDICES:
             bundle_to_node_id = get_bundles_for_indices(
                 placement_group,
                 list(map(int, envs.VLLM_RAY_BUNDLE_INDICES.split(","))),
+                self.world_size,
+            )
+        elif (
+            self.parallel_config.enable_layerwise_split
+            and self.parallel_config.split_stage_1_tensor_parallel_size > 1
+            and envs.VLLM_SPLIT_STAGE_NODE_MAP is not None
+        ):
+            # Placement group was created with per-rank node affinity, so
+            # bundle index == rank. Preserve that order.
+            bundle_to_node_id = get_bundles_for_indices(
+                placement_group,
+                list(range(self.world_size)),
                 self.world_size,
             )
         else:
@@ -291,6 +365,18 @@ class RayExecutorV2(MultiprocExecutor):
                 }
             )
 
+        logger.info(
+            "Ray bundle assignments: %s",
+            [
+                {
+                    "rank": a["rank"],
+                    "bundle_id_idx": a["bundle_id_idx"],
+                    "node_ip": a["node_ip"],
+                }
+                for a in bundle_assignments
+            ],
+        )
+
         # Step 3: Resolve the IP for torch.distributed TCPStore.
         # The TCPStore server runs on rank 0's node, so all workers
         # must be able to reach this address.
@@ -298,9 +384,25 @@ class RayExecutorV2(MultiprocExecutor):
         distributed_init_method = get_distributed_init_method(dist_ip, get_open_port())
 
         # Step 4: Create broadcast MessageQueue.
-        # Workers on the driver node use shared memory; the rest use TCP.
+        # Workers on the driver node normally use shared memory; the rest use
+        # TCP.  In layer-wise split mode, Ray's SPREAD placement can put the
+        # driver-node ranks at non-contiguous positions (e.g. rank 0 and 2 on
+        # the driver, rank 1 remote).  The current MessageQueue implementation
+        # assumes local readers are exactly ranks 0..n_local-1, which breaks
+        # routing for non-contiguous local ranks.  As a conservative workaround
+        # for the MVP, disable the SHM optimization in split mode so all
+        # workers use TCP.
+        # TODO: teach MessageQueue to accept an explicit local-rank set instead
+        # of a contiguous prefix, then re-enable SHM for split mode.
         max_chunk_bytes = envs.VLLM_MQ_MAX_CHUNK_BYTES_MB * 1024 * 1024
         n_local = sum(1 for a in bundle_assignments if a["node_id"] == driver_node)
+        if self.parallel_config.enable_layerwise_split:
+            logger.info(
+                "Layer-wise split mode: forcing broadcast MQ n_local=0 "
+                "(would be %d); local ranks may be non-contiguous.",
+                n_local,
+            )
+            n_local = 0
         self.rpc_broadcast_mq = MessageQueue(
             self.world_size,
             n_local,
@@ -514,6 +616,13 @@ class RayExecutorV2(MultiprocExecutor):
                 logger.debug("Killed actor rank=%d", handle.rank)
             except Exception:
                 logger.exception("Failed to kill actor rank=%d", handle.rank)
+
+        if registry := getattr(self, "_split_endpoint_registry", None):
+            try:
+                ray.kill(registry)
+                logger.debug("Killed split endpoint registry actor")
+            except Exception:
+                logger.exception("Failed to kill split endpoint registry actor")
 
         if rpc_broadcast_mq := getattr(self, "rpc_broadcast_mq", None):
             rpc_broadcast_mq.shutdown()

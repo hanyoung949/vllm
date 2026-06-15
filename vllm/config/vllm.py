@@ -840,6 +840,31 @@ class VllmConfig:
             "expandable_segments is automatically disabled)."
         )
 
+    @staticmethod
+    def _validate_layerwise_split_with_cb_tp(
+        parallel_config: "ParallelConfig",
+        compilation_config: "CompilationConfig",
+    ) -> None:
+        """Fail-closed guard for layer-wise split with stage_1 tensor parallelism.
+
+        Phase 4 MVP sends full replica tensors between stages and does not yet
+        implement intra-stage_1 all-gather/sharding for sequence-parallel
+        activations. Fail closed if SP is enabled together with stage_1 TP > 1.
+        This should be called after all compilation/pass_config defaults and
+        corrections have been applied so the final enable_sp value is checked.
+        """
+        if (
+            parallel_config.enable_layerwise_split
+            and parallel_config.split_stage_1_tensor_parallel_size > 1
+            and compilation_config.pass_config.enable_sp
+        ):
+            raise ValueError(
+                "layer-wise split with split_stage_1_tensor_parallel_size > 1 is "
+                "not supported with sequence parallelism "
+                "(compilation_config.pass_config.enable_sp=True). "
+                "Please disable sequence parallelism."
+            )
+
     def __post_init__(self):
         """Verify configs are valid & consistent with each other."""
 
@@ -1194,6 +1219,12 @@ class VllmConfig:
                     )
                     pass_config.enable_sp = False
                     pass_config.fuse_gemm_comms = False
+
+        # Fail-closed guard after all compilation/pass_config defaults and
+        # corrections have been applied.
+        VllmConfig._validate_layerwise_split_with_cb_tp(
+            self.parallel_config, self.compilation_config
+        )
 
         from vllm.utils.torch_utils import HAS_OPAQUE_TYPE
 

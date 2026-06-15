@@ -4650,9 +4650,8 @@ class GPUModelRunner(
         # Skip for chunked prefill: sampled tokens are dummy
         # and will be discarded, no need to broadcast.
         if not self._is_all_reqs_chunked_prefill():
-            torch.distributed.broadcast(
-                sampled_token_ids, src=pp.rank, group=pp.device_group
-            )
+            pp.set_token_metadata(self.input_batch.req_ids)
+            pp.broadcast_sampled_token_ids(sampled_token_ids, src=pp.rank)
 
     def _pp_receive_prev_sampled_token_ids_to_input_batch(self) -> None:
         """Receive sampled token ids broadcast from last PP stage"""
@@ -4663,7 +4662,13 @@ class GPUModelRunner(
         recv = torch.empty((num_reqs, 1), dtype=torch.int32, device=self.device)
         # skip for chunked prefill.
         if not self._is_all_reqs_chunked_prefill():
-            torch.distributed.broadcast(recv, src=pp.last_rank, group=pp.device_group)
+            pp.broadcast_sampled_token_ids(recv, src=pp.last_rank)
+            if (token_req_ids := pp.get_token_metadata()) is not None:
+                logger.debug(
+                    "PP rank %d received split token metadata: req_ids=%s",
+                    pp.rank,
+                    token_req_ids,
+                )
         self.input_batch.prev_sampled_token_ids = recv
 
         # construct `prev_req_id_to_index` here so `_prepare_input_ids`

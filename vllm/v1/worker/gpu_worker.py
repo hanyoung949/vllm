@@ -263,10 +263,15 @@ class Worker(WorkerBase):
                 if dp_local_rank is None:
                     dp_local_rank = self.parallel_config.data_parallel_index
 
-                tp_pp_world_size = (
-                    self.parallel_config.pipeline_parallel_size
-                    * self.parallel_config.tensor_parallel_size
-                )
+                if self.parallel_config.enable_layerwise_split:
+                    tp_pp_world_size = (
+                        1 + self.parallel_config.split_stage_1_tensor_parallel_size + 1
+                    )
+                else:
+                    tp_pp_world_size = (
+                        self.parallel_config.pipeline_parallel_size
+                        * self.parallel_config.tensor_parallel_size
+                    )
 
                 # DP_LOCAL_RANK * TP_PP_WORLD_SIZE + TP_LOCAL_RANK
                 self.local_rank += dp_local_rank * tp_pp_world_size
@@ -861,6 +866,15 @@ class Worker(WorkerBase):
                 comm_handles=comm_handles,
                 comm_postprocess=comm_postprocess,
             )
+            if (meta := get_pp_group().get_tensor_metadata()) is not None:
+                logger.debug(
+                    "PP rank %d received split tensor metadata: "
+                    "req_ids=%s num_scheduled_tokens=%s is_prompt=%s",
+                    get_pp_group().rank,
+                    meta.get("req_ids"),
+                    meta.get("num_scheduled_tokens"),
+                    meta.get("is_prompt"),
+                )
 
         with self.annotate_profile(scheduler_output):
             output = self.model_runner.execute_model(
@@ -885,6 +899,14 @@ class Worker(WorkerBase):
         )
 
         # launch non-blocking send of intermediate tensors
+        if scheduler_output.total_num_scheduled_tokens > 0:
+            get_pp_group().set_tensor_metadata(
+                req_ids=list(scheduler_output.num_scheduled_tokens.keys()),
+                num_scheduled_tokens=list(
+                    scheduler_output.num_scheduled_tokens.values()
+                ),
+                is_prompt=len(scheduler_output.scheduled_new_reqs) > 0,
+            )
         self._pp_send_work = get_pp_group().isend_tensor_dict(
             output.tensors,
             all_gather_group=get_tp_group(),

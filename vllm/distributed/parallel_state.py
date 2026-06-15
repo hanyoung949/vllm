@@ -423,7 +423,12 @@ class GroupCoordinator:
                     cpu_group = torch.distributed.new_group(
                         ranks, backend="gloo", timeout=timeout
                     )
-                if self.rank in ranks:
+                # A rank may appear in multiple groups (e.g. layer-wise split
+                # with stage_1 TP, where stage_0 and stage_2 belong to every stage_1 TP rank's PP
+                # group).  Only record the first matching group so that the
+                # representative layout matches the order returned by the
+                # group-rank builder.
+                if self.rank in ranks and self_device_group is None:
                     self.ranks = ranks
                     self.world_size = len(ranks)
                     self.rank_in_group = ranks.index(self.rank)
@@ -722,6 +727,54 @@ class GroupCoordinator:
             input_, src=self.ranks[src], group=self.device_group
         )
         return input_
+
+    def broadcast_sampled_token_ids(
+        self, token_ids: torch.Tensor, src: int
+    ) -> torch.Tensor:
+        """Broadcast sampled token ids from ``src`` to all ranks.
+
+        This is semantically identical to :meth:`broadcast` but gives the split
+        pipeline group an explicit hook to route sampled token ids over its
+        custom token transport instead of NCCL.  Native vLLM implementations can
+        simply delegate to :meth:`broadcast`.
+        """
+        return self.broadcast(token_ids, src=src)
+
+    def set_tensor_metadata(
+        self,
+        req_ids: list[str],
+        num_scheduled_tokens: list[int],
+        is_prompt: bool,
+    ) -> None:
+        """Set metadata for the next tensor dict sent over the PP group.
+
+        This is a no-op for the native NCCL pipeline group; it is used by the
+        layer-wise split pipeline group to annotate activation packets with the
+        request IDs, number of scheduled tokens in this iteration, and
+        prompt/decode flag of the current batch.
+        """
+        return None
+
+    def get_tensor_metadata(self) -> dict[str, Any] | None:
+        """Get metadata from the last tensor dict received over the PP group.
+
+        This is a no-op for the native NCCL pipeline group.
+        """
+        return None
+
+    def set_token_metadata(self, req_ids: list[str]) -> None:
+        """Set metadata for the next sampled-token broadcast.
+
+        This is a no-op for the native NCCL pipeline group.
+        """
+        return None
+
+    def get_token_metadata(self) -> list[str] | None:
+        """Get metadata from the last sampled-token broadcast received.
+
+        This is a no-op for the native NCCL pipeline group.
+        """
+        return None
 
     def broadcast_object(self, obj: Any | None = None, src: int = 0):
         """Broadcast the input object.
@@ -1671,6 +1724,77 @@ def init_distributed_environment(
             _INNER_DP_WORLD = _WORLD
 
 
+def _build_layerwise_split_group_ranks(
+    world_size: int,
+    stage_1_tensor_parallel_size: int,
+    data_parallel_size: int,
+    prefill_context_parallel_size: int,
+    decode_context_parallel_size: int,
+) -> tuple[list[list[int]], list[list[int]], list[list[int]], list[list[int]], list[list[int]]]:
+    """Build TP/DCP/PCP/PP/DP group ranks for asymmetric layer-wise split.
+
+    Topology per DP replica: stage_0=1 GPU, stage_1=stage_1_tensor_parallel_size GPUs,
+    stage_2=1 GPU.  The global rank layout is therefore:
+    ``[stage_0, stage_1_tp0, stage_1_tp1, ..., stage_1_tp{N-1}, stage_2]`` repeated per replica.
+
+    Returns ``(tp_group_ranks, dcp_group_ranks, pcp_group_ranks,
+    pp_group_ranks, dp_group_ranks)``.
+    """
+    assert prefill_context_parallel_size == 1, (
+        "layer-wise split with stage_1 TP only supports "
+        "prefill_context_parallel_size=1"
+    )
+    assert decode_context_parallel_size == 1, (
+        "layer-wise split with stage_1 TP only supports "
+        "decode_context_parallel_size=1"
+    )
+
+    replica_size = 1 + stage_1_tensor_parallel_size + 1
+    assert world_size % replica_size == 0, (
+        f"world_size {world_size} must be divisible by replica_size {replica_size}"
+    )
+    num_replicas = world_size // replica_size
+    assert num_replicas == data_parallel_size, (
+        f"expected {num_replicas} DP replicas but data_parallel_size="
+        f"{data_parallel_size}"
+    )
+
+    tp_group_ranks: list[list[int]] = []
+    pp_group_ranks: list[list[int]] = []
+    dp_group_ranks: list[list[int]] = [[] for _ in range(replica_size)]
+
+    for replica in range(num_replicas):
+        base = replica * replica_size
+        stage_0_rank = base
+        stage_1_ranks = list(range(base + 1, base + 1 + stage_1_tensor_parallel_size))
+        stage_2_rank = base + stage_1_tensor_parallel_size + 1
+
+        tp_group_ranks.append([stage_0_rank])
+        tp_group_ranks.append(stage_1_ranks)
+        tp_group_ranks.append([stage_2_rank])
+
+        # Create one PP group per stage_1 TP rank so that every rank has a valid
+        # pipeline-parallel group.  The first PP group (using stage_1_tp0) is the
+        # representative group used for inter-stage split transport; stage_0 and stage_2
+        # appear in all PP groups but their global _PP is assigned to the first
+        # one by GroupCoordinator's first-match rule.
+        for stage_1_tp_rank in stage_1_ranks:
+            pp_group_ranks.append([stage_0_rank, stage_1_tp_rank, stage_2_rank])
+
+        for pos in range(replica_size):
+            dp_group_ranks[pos].append(base + pos)
+
+    # DCP and PCP are singleton groups since their sizes are constrained to 1.
+    singleton_groups = [[r] for r in range(world_size)]
+    return (
+        tp_group_ranks,
+        singleton_groups,
+        singleton_groups,
+        pp_group_ranks,
+        dp_group_ranks,
+    )
+
+
 def initialize_model_parallel(
     tensor_model_parallel_size: int = 1,
     pipeline_model_parallel_size: int = 1,
@@ -1737,34 +1861,112 @@ def initialize_model_parallel(
             get_world_group().device_group
         )
 
-    # the layout order is: ExternalDP x DP x PP x TP
-    # ExternalDP is the data parallel group that is not part of the model,
-    # every dp rank can generate independently (in verl integration).
-    # DP is the data parallel group that is part of the model,
-    # all the ranks in the same DP group should generate simultaneously,
-    # i.e. the `generate` call in the same DP group should be called together,
-    # otherwise it will cause deadlock.
-    # to get group_ranks for each dimension, transpose that dimension to the
-    # last dimension, then reshape to 2D, then unbind the last dimension
-    all_ranks = torch.arange(world_size).reshape(
-        -1,
-        data_parallel_size,
-        pipeline_model_parallel_size,
-        prefill_context_model_parallel_size,
-        tensor_model_parallel_size,
-    )  # noqa
+    # Compute group ranks.  Layer-wise split with stage_1 TP uses an asymmetric
+    # topology (stage_0=1, stage_1=N, stage_2=1) and therefore cannot use the uniform
+    # ExternalDP x DP x PP x PCP x TP tensor layout.
+    use_layerwise_split_topology = (
+        parallel_config.enable_layerwise_split
+        and pipeline_model_parallel_size > 1
+        and parallel_config.split_stage_1_tensor_parallel_size > 1
+    )
+    if use_layerwise_split_topology:
+        assert not enable_elastic_ep, (
+            "layer-wise split with stage_1 TP is not supported with elastic EP"
+        )
+        (
+            tp_group_ranks,
+            dcp_group_ranks,
+            pcp_group_ranks,
+            pp_group_ranks,
+            dp_group_ranks,
+        ) = _build_layerwise_split_group_ranks(
+            world_size=world_size,
+            stage_1_tensor_parallel_size=parallel_config.split_stage_1_tensor_parallel_size,
+            data_parallel_size=data_parallel_size,
+            prefill_context_parallel_size=prefill_context_model_parallel_size,
+            decode_context_parallel_size=decode_context_model_parallel_size,
+        )
+    else:
+        # the layout order is: ExternalDP x DP x PP x TP
+        # ExternalDP is the data parallel group that is not part of the model,
+        # every dp rank can generate independently (in verl integration).
+        # DP is the data parallel group that is part of the model,
+        # all the ranks in the same DP group should generate simultaneously,
+        # i.e. the `generate` call in the same DP group should be called together,
+        # otherwise it will cause deadlock.
+        # to get group_ranks for each dimension, transpose that dimension to the
+        # last dimension, then reshape to 2D, then unbind the last dimension
+        all_ranks = torch.arange(world_size).reshape(
+            -1,
+            data_parallel_size,
+            pipeline_model_parallel_size,
+            prefill_context_model_parallel_size,
+            tensor_model_parallel_size,
+        )  # noqa
+
+        tp_group_ranks = [
+            x.tolist()
+            for x in all_ranks.view(-1, tensor_model_parallel_size).unbind(0)
+        ]
+        if enable_elastic_ep:
+            tp_group_ranks = [
+                x.tolist()
+                for x in local_all_ranks.view(-1, tensor_model_parallel_size).unbind(0)
+            ]
+
+        dcp_group_ranks = [
+            x.tolist()
+            for x in all_ranks.reshape(-1, decode_context_model_parallel_size).unbind(0)
+        ]
+        if enable_elastic_ep:
+            dcp_group_ranks = [
+                x.tolist()
+                for x in local_all_ranks.reshape(
+                    -1, decode_context_model_parallel_size
+                ).unbind(0)
+            ]
+
+        pcp_group_ranks = [
+            x.tolist()
+            for x in all_ranks.transpose(3, 4)
+            .reshape(-1, prefill_context_model_parallel_size)
+            .unbind(0)
+        ]
+        if enable_elastic_ep:
+            pcp_group_ranks = [
+                x.tolist()
+                for x in local_all_ranks.transpose(1, 2)
+                .reshape(-1, prefill_context_model_parallel_size)
+                .unbind(0)
+            ]
+
+        pp_group_ranks = [
+            x.tolist()
+            for x in all_ranks.transpose(2, 4)
+            .reshape(-1, pipeline_model_parallel_size)
+            .unbind(0)
+        ]
+        if enable_elastic_ep:
+            pp_group_ranks = [
+                x.tolist()
+                for x in local_all_ranks.transpose(0, 2)
+                .reshape(-1, pipeline_model_parallel_size)
+                .unbind(0)
+            ]
+
+        dp_group_ranks = [
+            x.tolist()
+            for x in all_ranks.transpose(1, 4)
+            .reshape(-1, data_parallel_size)
+            .unbind(0)
+        ]
 
     # Build the tensor model-parallel groups.
     global _TP
     assert _TP is None, "tensor model parallel group is already initialized"
-    group_ranks = all_ranks.view(-1, tensor_model_parallel_size).unbind(0)
-    group_ranks = [x.tolist() for x in group_ranks]
-    if enable_elastic_ep:
-        group_ranks = local_all_ranks.view(-1, tensor_model_parallel_size).unbind(0)
-        group_ranks = [x.tolist() for x in group_ranks]
     # message queue broadcaster is only used in tensor model parallel group
     _TP = init_model_parallel_group(
-        group_ranks,
+        tp_group_ranks,
         get_world_group().local_rank,
         backend,
         use_message_queue_broadcaster=True,
@@ -1774,19 +1976,8 @@ def initialize_model_parallel(
     # Build the DCP model-parallel groups.
     global _DCP
     assert _DCP is None, "decode context model parallel group is already initialized"
-    # Note(hc): In the current implementation of decode context parallel,
-    # dcp_size must not exceed tp_size, because the world size does not
-    # change by DCP, it simply reuses the GPUs of TP group, and split one
-    # TP group into tp_size//dcp_size DCP groups.
-    group_ranks = all_ranks.reshape(-1, decode_context_model_parallel_size).unbind(0)
-    group_ranks = [x.tolist() for x in group_ranks]
-    if enable_elastic_ep:
-        group_ranks = local_all_ranks.reshape(
-            -1, decode_context_model_parallel_size
-        ).unbind(0)
-        group_ranks = [x.tolist() for x in group_ranks]
     _DCP = init_model_parallel_group(
-        group_ranks,
+        dcp_group_ranks,
         get_world_group().local_rank,
         backend,
         use_message_queue_broadcaster=True,
@@ -1795,46 +1986,121 @@ def initialize_model_parallel(
 
     global _PCP
     assert _PCP is None, "prefill context parallel group is already initialized"
-    group_ranks = (
-        all_ranks.transpose(3, 4)
-        .reshape(-1, prefill_context_model_parallel_size)
-        .unbind(0)
-    )
-    group_ranks = [x.tolist() for x in group_ranks]
-    if enable_elastic_ep:
-        group_ranks = (
-            local_all_ranks.transpose(1, 2)
-            .reshape(-1, prefill_context_model_parallel_size)
-            .unbind(0)
-        )
-        group_ranks = [x.tolist() for x in group_ranks]
     _PCP = init_model_parallel_group(
-        group_ranks, get_world_group().local_rank, backend, group_name="pcp"
+        pcp_group_ranks,
+        get_world_group().local_rank,
+        backend,
+        group_name="pcp",
     )
 
     # Build the pipeline model-parallel groups.
     global _PP
     assert _PP is None, "pipeline model parallel group is already initialized"
-    group_ranks = (
-        all_ranks.transpose(2, 4).reshape(-1, pipeline_model_parallel_size).unbind(0)
+
+    # Always create the underlying NCCL pipeline-parallel group first.  In the
+    # layer-wise split case we wrap it with a custom transport that reroutes
+    # activation tensor dicts over TCP/ZMQ while keeping NCCL collectives for
+    # small metadata (e.g. sampled-token broadcast) intact.  The device
+    # communicator (PYNCCL/custom all-reduce) is not needed for PP traffic in
+    # split mode, and creating it for overlapping non-representative PP groups
+    # (where not all members initialize the communicator) can deadlock.
+    use_pp_device_communicator = not (
+        parallel_config.enable_layerwise_split and pipeline_model_parallel_size > 1
     )
-    group_ranks = [x.tolist() for x in group_ranks]
-    if enable_elastic_ep:
-        group_ranks = (
-            local_all_ranks.transpose(0, 2)
-            .reshape(-1, pipeline_model_parallel_size)
-            .unbind(0)
+    _base_pp = init_model_parallel_group(
+        pp_group_ranks,
+        get_world_group().local_rank,
+        backend,
+        group_name="pp",
+        use_device_communicator=use_pp_device_communicator,
+    )
+
+    if parallel_config.enable_layerwise_split and pipeline_model_parallel_size > 1:
+        from vllm.distributed.split_pipeline_group import (
+            SplitPipelineGroup,
+            _parse_recv_addrs,
         )
-        group_ranks = [x.tolist() for x in group_ranks]
-    _PP = init_model_parallel_group(
-        group_ranks, get_world_group().local_rank, backend, group_name="pp"
-    )
+
+        # Infer stage from global rank so that non-representative stage_1 ranks still
+        # know they belong to the stage_1 stage.
+        stage_1_tp_size = parallel_config.split_stage_1_tensor_parallel_size
+        replica_size = 1 + stage_1_tp_size + 1
+        rank_in_replica = rank % replica_size
+        if rank_in_replica == 0:
+            stage = "stage_0"
+        elif rank_in_replica < 1 + stage_1_tp_size:
+            stage = "stage_1"
+        else:
+            stage = "stage_2"
+        if parallel_config.split_stage is not None:
+            stage = parallel_config.split_stage
+
+        pp_rank = _base_pp.rank_in_group
+
+        # The representative PP group (the one containing stage_1 TP rank 0) hosts
+        # the ZMQ split transport.  Other stage_1 ranks also get a SplitPipelineGroup
+        # but in non-representative mode: inter-stage tensors/tokens are relayed
+        # through intra-stage TP collectives from/to the representative rank.
+        stage_1_representative_rank = (rank // replica_size) * replica_size + 1
+        is_representative_pp = stage_1_representative_rank in _base_pp.ranks
+
+        tensor_recv_addrs: list[str] | None = None
+        token_recv_addrs: list[str] | None = None
+        if is_representative_pp:
+            # Prefer auto-discovery when a registry actor is configured.  This
+            # avoids accidentally using stale/static addresses that may have been
+            # exported in the environment but do not match the current placement.
+            registry_name = envs.VLLM_SPLIT_ENDPOINT_REGISTRY_NAME
+            if registry_name:
+                if envs.VLLM_SPLIT_TENSOR_RECV_ADDRS or envs.VLLM_SPLIT_TOKEN_RECV_ADDRS:
+                    logger.warning(
+                        "VLLM_SPLIT_ENDPOINT_REGISTRY_NAME is set; ignoring "
+                        "VLLM_SPLIT_TENSOR_RECV_ADDRS / VLLM_SPLIT_TOKEN_RECV_ADDRS "
+                        "and using registry auto-discovery instead."
+                    )
+                from vllm.v1.engine.split_endpoint_registry import (
+                    discover_split_endpoints,
+                )
+
+                tensor_recv_addrs, token_recv_addrs = discover_split_endpoints(
+                    pp_rank=pp_rank,
+                    world_size=pipeline_model_parallel_size,
+                    registry_name=registry_name,
+                )
+            else:
+                tensor_recv_addrs = _parse_recv_addrs(
+                    envs.VLLM_SPLIT_TENSOR_RECV_ADDRS
+                )
+                token_recv_addrs = _parse_recv_addrs(
+                    envs.VLLM_SPLIT_TOKEN_RECV_ADDRS
+                )
+                if tensor_recv_addrs is None or token_recv_addrs is None:
+                    raise RuntimeError(
+                        "VLLM_SPLIT_TENSOR_RECV_ADDRS and "
+                        "VLLM_SPLIT_TOKEN_RECV_ADDRS must be set, or "
+                        "VLLM_SPLIT_ENDPOINT_REGISTRY_NAME must be provided for "
+                        "layer-wise split endpoint auto-discovery."
+                    )
+
+        _PP = SplitPipelineGroup(
+            base_group=_base_pp,
+            rank=pp_rank,
+            world_size=pipeline_model_parallel_size,
+            stage_label=stage,
+            is_representative=is_representative_pp,
+            tensor_recv_addrs=tensor_recv_addrs,
+            token_recv_addrs=token_recv_addrs,
+        )
+    else:
+        _PP = _base_pp
 
     global _DP
     assert _DP is None, "data parallel group is already initialized"
-    group_ranks = all_ranks.transpose(1, 4).reshape(-1, data_parallel_size).unbind(0)
-    group_ranks = [x.tolist() for x in group_ranks]
     if enable_elastic_ep:
+        group_ranks = (
+            all_ranks.transpose(1, 4).reshape(-1, data_parallel_size).unbind(0)
+        )
+        group_ranks = [x.tolist() for x in group_ranks]
         _DP = _init_stateless_group(
             group_ranks,
             "dp",
@@ -1844,13 +2110,20 @@ def initialize_model_parallel(
         )
     else:
         _DP = init_model_parallel_group(
-            group_ranks, get_world_group().local_rank, backend, group_name="dp"
+            dp_group_ranks,
+            get_world_group().local_rank,
+            backend,
+            group_name="dp",
         )
 
     global _EP
     assert _EP is None, "expert parallel group is already initialized"
     # Don't create EP group for dense models.
     if config.model_config is None or config.model_config.is_moe:
+        if use_layerwise_split_topology:
+            raise NotImplementedError(
+                "layer-wise split with stage_1 TP does not support MoE / EP groups"
+            )
         group_ranks = (
             all_ranks.transpose(1, 2)
             .reshape(
@@ -1941,11 +2214,21 @@ def ensure_model_parallel_initialized(
         )
         return
 
-    assert get_tensor_model_parallel_world_size() == tensor_model_parallel_size, (
-        "tensor parallel group already initialized, but of unexpected size. "
-        f"got: {get_tensor_model_parallel_world_size()=} vs. "
-        f"wanted: {tensor_model_parallel_size=}"
+    from vllm.config import get_current_vllm_config
+
+    parallel_config = get_current_vllm_config().parallel_config
+    is_split_stage_1_tp = (
+        parallel_config.enable_layerwise_split
+        and pipeline_model_parallel_size > 1
+        and parallel_config.split_stage_1_tensor_parallel_size > 1
     )
+
+    if not is_split_stage_1_tp:
+        assert get_tensor_model_parallel_world_size() == tensor_model_parallel_size, (
+            "tensor parallel group already initialized, but of unexpected size. "
+            f"got: {get_tensor_model_parallel_world_size()=} vs. "
+            f"wanted: {tensor_model_parallel_size=}"
+        )
     pp_world_size = get_pp_group().world_size
     assert pp_world_size == pipeline_model_parallel_size, (
         "pipeline parallel group already initialized, but of unexpected size. "
