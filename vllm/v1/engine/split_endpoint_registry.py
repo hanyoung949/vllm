@@ -149,13 +149,29 @@ def _get_worker_node_ip() -> str:
     """Return the IP address this split worker should bind/connect to.
 
     Priority:
-      1. ``VLLM_HOST_IP`` if explicitly configured per node.
-      2. The IP of the interface named in ``NCCL_SOCKET_IFNAME`` (first
-         interface if comma-separated).  This aligns ZMQ binds with the
-         interface NCCL will use and avoids Docker/bridge IPs.
-      3. Ray's node IP address.
-      4. Generic outgoing-interface detection.
+      1. For explicit split stage-node maps, use the current worker node IP
+         instead of ``VLLM_HOST_IP``. Ray runtime envs can accidentally copy
+         the driver host IP to remote split workers.
+      2. ``VLLM_HOST_IP`` if explicitly configured per node.
+      3. The IP of the interface named in ``NCCL_SOCKET_IFNAME``.
+      4. Ray node IP address.
+      5. Generic outgoing-interface detection.
     """
+    if os.environ.get("VLLM_SPLIT_STAGE_NODE_MAP"):
+        nccl_iface = os.environ.get("NCCL_SOCKET_IFNAME", "")
+        if nccl_iface:
+            first_iface = nccl_iface.split(",")[0].strip()
+            if first_iface:
+                iface_ip = _get_interface_ip(first_iface)
+                if iface_ip:
+                    return iface_ip
+
+        if ray is not None:
+            try:
+                return ray.util.get_node_ip_address()
+            except Exception:
+                pass
+
     host_ip = envs.VLLM_HOST_IP
     if host_ip:
         return host_ip
