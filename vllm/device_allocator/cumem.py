@@ -192,12 +192,23 @@ class CuMemAllocator:
             if data.tag in offload_tags:
                 backup_bytes += handle[1]
                 size_in_bytes = handle[1]
-                cpu_backup_tensor = torch.empty(
-                    size_in_bytes,
-                    dtype=torch.uint8,
-                    device="cpu",
-                    pin_memory=is_pin_memory_available(),
-                )
+                try:
+                    cpu_backup_tensor = torch.empty(
+                        size_in_bytes,
+                        dtype=torch.uint8,
+                        device="cpu",
+                        pin_memory=is_pin_memory_available(),
+                    )
+                except torch.AcceleratorError:
+                    logger.warning(
+                        "pin_memory failed during sleep, "
+                        "falling back to non-pinned CPU memory.")
+                    cpu_backup_tensor = torch.empty(
+                        size_in_bytes,
+                        dtype=torch.uint8,
+                        device="cpu",
+                        pin_memory=False,
+                    )
                 cpu_ptr = cpu_backup_tensor.data_ptr()
                 libcudart.cudaMemcpy(cpu_ptr, ptr, size_in_bytes)
                 data.cpu_backup_tensor = cpu_backup_tensor
