@@ -20,12 +20,14 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+import os
 import time
 
 import torch
 
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.utils.split_trace import get_split_trace_logger
 from vllm.v1.engine.split_data import SplitTensorPacket, SplitTokenPacket
 from vllm.v1.engine.split_transport import (
     LocalLoopbackTransport,
@@ -139,7 +141,9 @@ class SplitPipelineGroup:
         self.rank = rank
         self.world_size = world_size
         self._stage_label = stage_label
+        os.environ.setdefault("SPLIT_STAGE", stage_label)
         self._is_representative = is_representative
+        self._trace = get_split_trace_logger("rollout_comm")
 
         if is_representative:
             if tensor_recv_addrs is None:
@@ -314,8 +318,12 @@ class SplitPipelineGroup:
         self._tensor_metadata = None
         assert self._transport is not None
         send_bytes = _tensor_dict_bytes(tensor_dict)
+        self._trace.log(phase="activation_send", event="start",
+                        bytes_=send_bytes, extra={"is_prompt": packet.is_prompt})
         t0 = time.perf_counter()
         self._transport.send_tensor_packet(packet)
+        self._trace.log(phase="activation_send", event="end",
+                        bytes_=send_bytes, extra={"is_prompt": packet.is_prompt})
         elapsed_ms = (time.perf_counter() - t0) * 1000
         logger.info(
             "SPLIT_TIMING isend_tensor_dict rank=%d bytes=%d tensors=%d "
@@ -357,8 +365,10 @@ class SplitPipelineGroup:
                 f"stage (rank {expected_src}), got src={src}."
             )
         assert self._transport is not None
+        self._trace.log(phase="activation_recv", event="start")
         t0 = time.perf_counter()
         packet = self._transport.recv_tensor_packet(device=self._base.device)
+        self._trace.log(phase="activation_recv", event="end")
         elapsed_ms = (time.perf_counter() - t0) * 1000
         recv_bytes = _tensor_dict_bytes(packet.tensors)
         logger.info(
@@ -460,8 +470,11 @@ class SplitPipelineGroup:
             )
             self._token_metadata = None
             assert self._token_transport is not None
+            token_bytes = int(token_ids.numel() * token_ids.element_size())
+            self._trace.log(phase="token_send", event="start", bytes_=token_bytes)
             t0 = time.perf_counter()
             self._token_transport.send_token_packet(packet)
+            self._trace.log(phase="token_send", event="end", bytes_=token_bytes)
             elapsed_ms = (time.perf_counter() - t0) * 1000
             logger.info(
                 "SPLIT_TIMING send_token_packet rank=%d shape=%s time_ms=%.3f",
@@ -472,8 +485,10 @@ class SplitPipelineGroup:
         else:
             # stage_0/stage_1 representative: receive and fill the input tensor in-place.
             assert self._token_transport is not None
+            self._trace.log(phase="token_recv", event="start")
             t0 = time.perf_counter()
             packet = self._token_transport.recv_token_packet()
+            self._trace.log(phase="token_recv", event="end")
             elapsed_ms = (time.perf_counter() - t0) * 1000
             logger.info(
                 "SPLIT_TIMING recv_token_packet rank=%d shape=%s time_ms=%.3f",

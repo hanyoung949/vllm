@@ -58,6 +58,7 @@ from vllm.tracing import instrument
 from vllm.utils.gc_utils import freeze_gc_heap, maybe_attach_gc_debug_callback
 from vllm.utils.mem_constants import GiB_bytes
 from vllm.utils.mem_utils import MemorySnapshot, format_gib, memory_profiling
+from vllm.utils.split_trace import get_split_trace_logger
 from vllm.utils.torch_utils import set_random_seed
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
@@ -146,6 +147,10 @@ class Worker(WorkerBase):
         # is available, since the engine needs a reference to the model.
         self.weight_transfer_engine: WeightTransferEngine | None = None
         self._weight_update_active = False
+
+        # Split trace logger (no-op unless SPLIT_TRACE_DIR is set)
+        self._split_trace = get_split_trace_logger("rollout")
+        self._split_trace_token_idx = 0
         self._is_checkpoint_format = True
 
         # Torch/CUDA profiler. Enabled and configured through profiler_config.
@@ -876,20 +881,26 @@ class Worker(WorkerBase):
                     meta.get("is_prompt"),
                 )
 
-        with self.annotate_profile(scheduler_output):
-            output = self.model_runner.execute_model(
-                scheduler_output, intermediate_tensors
-            )
-            if (
-                self.use_v2_model_runner
-                and self.model_runner.is_pooling_model
-                and output is None
-            ):
-                output = self.model_runner.pool()  # type: ignore
-            if isinstance(
-                output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
-            ):
-                return output
+        with self._split_trace.trace(
+            "rollout_forward",
+            token_idx=self._split_trace_token_idx,
+            num_scheduled_tokens=num_scheduled_tokens,
+        ):
+            with self.annotate_profile(scheduler_output):
+                output = self.model_runner.execute_model(
+                    scheduler_output, intermediate_tensors
+                )
+                if (
+                    self.use_v2_model_runner
+                    and self.model_runner.is_pooling_model
+                    and output is None
+                ):
+                    output = self.model_runner.pool()  # type: ignore
+                if isinstance(
+                    output, ModelRunnerOutput | AsyncModelRunnerOutput | NoneType
+                ):
+                    return output
+        self._split_trace_token_idx += 1
 
         assert isinstance(output, IntermediateTensors)
         parallel_config = self.vllm_config.parallel_config
