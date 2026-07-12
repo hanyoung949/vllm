@@ -77,6 +77,7 @@ class SplitPPHandler(PPHandler):
             if self._split_pp._is_representative:
                 # stage_0/stage_1 representative: receive over TCP from stage_2.
                 packet = self._split_pp._token_transport.recv_token_packet()
+                packet.validate_req_ids(input_batch.req_ids)
                 recv_sampled, recv_num_sampled, recv_num_rejected = (
                     packet.to_tensors(
                         device=self.device,

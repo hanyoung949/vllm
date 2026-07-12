@@ -258,6 +258,18 @@ class SplitTokenPacket:
             num_rejected=num_rejected.tolist(),
         )
 
+    def validate_req_ids(self, expected_req_ids: list[str]) -> None:
+        """Fail fast if the packet's request ids do not match the local batch.
+
+        This guards against associating sampled tokens with the wrong requests
+        when driver/worker state diverges across the split TCP transport.
+        """
+        if self.req_ids != expected_req_ids:
+            raise ValueError(
+                f"SplitTokenPacket req_ids mismatch: expected "
+                f"{expected_req_ids!r}, got {self.req_ids!r}"
+            )
+
     def to_tensors(
         self,
         device: torch.device | str,

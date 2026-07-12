@@ -79,3 +79,73 @@ def test_split_token_packet_wrong_shape_raises():
         assert False, "Expected ValueError"
     except ValueError:
         pass
+
+
+def test_split_token_packet_v2_roundtrip_with_metadata():
+    req_ids = ["req_0", "req_1", "req_2"]
+    sampled_token_ids = torch.tensor(
+        [[1, 2, 3], [4, 5, 0], [6, 0, 0]], dtype=torch.int64
+    )
+    num_sampled = torch.tensor([3, 2, 1], dtype=torch.int32)
+    num_rejected = torch.tensor([0, 1, 0], dtype=torch.int32)
+
+    packet = SplitTokenPacket.from_tensors(
+        req_ids=req_ids,
+        sampled_token_ids=sampled_token_ids,
+        num_sampled=num_sampled,
+        num_rejected=num_rejected,
+    )
+    restored = SplitTokenPacket.deserialize(packet.serialize())
+
+    assert restored.req_ids == req_ids
+    assert restored.num_sampled == num_sampled.tolist()
+    assert restored.num_rejected == num_rejected.tolist()
+
+    out_sampled, out_num_sampled, out_num_rejected = restored.to_tensors(
+        device="cpu", num_reqs=3, max_sample_len=3
+    )
+    expected_sampled = torch.tensor(
+        [[1, 2, 3], [4, 5, 0], [6, 0, 0]], dtype=torch.int64
+    )
+    torch.testing.assert_close(out_sampled, expected_sampled)
+    torch.testing.assert_close(out_num_sampled, num_sampled)
+    torch.testing.assert_close(out_num_rejected, num_rejected)
+
+
+def test_split_token_packet_v2_req_count_mismatch_raises():
+    packet = SplitTokenPacket.from_tensors(
+        req_ids=["req_0", "req_1"],
+        sampled_token_ids=torch.tensor([[1], [2]], dtype=torch.int64),
+        num_sampled=torch.tensor([1, 1], dtype=torch.int32),
+        num_rejected=torch.tensor([0, 0], dtype=torch.int32),
+    )
+    restored = SplitTokenPacket.deserialize(packet.serialize())
+
+    try:
+        restored.to_tensors(device="cpu", num_reqs=3, max_sample_len=1)
+        assert False, "Expected ValueError for req count mismatch"
+    except ValueError:
+        pass
+
+    try:
+        restored.validate_req_ids(["req_0", "req_1", "req_2"])
+        assert False, "Expected ValueError for validate_req_ids count mismatch"
+    except ValueError:
+        pass
+
+
+def test_split_token_packet_v2_req_order_mismatch_raises():
+    req_ids = ["req_0", "req_1", "req_2"]
+    packet = SplitTokenPacket.from_tensors(
+        req_ids=req_ids,
+        sampled_token_ids=torch.tensor([[1], [2], [3]], dtype=torch.int64),
+        num_sampled=torch.tensor([1, 1, 1], dtype=torch.int32),
+        num_rejected=torch.tensor([0, 0, 0], dtype=torch.int32),
+    )
+
+    # Same set, wrong order: must fail fast.
+    try:
+        packet.validate_req_ids(["req_1", "req_0", "req_2"])
+        assert False, "Expected ValueError for req order mismatch"
+    except ValueError:
+        pass
