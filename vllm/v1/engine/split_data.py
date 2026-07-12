@@ -154,15 +154,18 @@ class SplitTensorPacket:
 
 @dataclass
 class SplitTokenPacket:
-    """Packet sent from stage_2 back to stage_0.
+    """Packet sent from stage_2 back to stage_0/stage_1.
 
-    Contains the sampled tokens and finish reasons for each request in the
-    batch.  Logprobs and other optional fields are left out in Phase 1.
+    Contains the sampled tokens and optional per-request metadata
+    (``num_sampled``, ``num_rejected``) needed by the V2 model runner.
+    Logprobs and other optional fields are left out in Phase 1.
     """
 
     req_ids: list[str]
     sampled_token_ids: list[list[int]]
     finish_reasons: list[str | None] = field(default_factory=list)
+    num_sampled: list[int] | None = None
+    num_rejected: list[int] | None = None
 
     def serialize(self) -> bytes:
         data: dict[str, Any] = {
@@ -170,6 +173,10 @@ class SplitTokenPacket:
             "sampled_token_ids": self.sampled_token_ids,
             "finish_reasons": self.finish_reasons,
         }
+        if self.num_sampled is not None:
+            data["num_sampled"] = self.num_sampled
+        if self.num_rejected is not None:
+            data["num_rejected"] = self.num_rejected
         return msgspec.msgpack.encode(data)
 
     @classmethod
@@ -179,6 +186,8 @@ class SplitTokenPacket:
             req_ids=decoded["req_ids"],
             sampled_token_ids=decoded["sampled_token_ids"],
             finish_reasons=decoded.get("finish_reasons", []),
+            num_sampled=decoded.get("num_sampled"),
+            num_rejected=decoded.get("num_rejected"),
         )
 
     @classmethod
@@ -220,6 +229,81 @@ class SplitTokenPacket:
                 raise ValueError(f"Empty sampled token list at index {i}")
             tensor[i, 0] = ids[0]
         return tensor
+
+    @classmethod
+    def from_tensors(
+        cls,
+        req_ids: list[str],
+        sampled_token_ids: torch.Tensor,
+        num_sampled: torch.Tensor,
+        num_rejected: torch.Tensor,
+    ) -> "SplitTokenPacket":
+        """Create a packet from the V2 model runner's sampled-token tensors.
+
+        ``sampled_token_ids`` has shape ``[num_reqs, max_sample_len]`` and dtype
+        ``torch.int64``.  ``num_sampled`` and ``num_rejected`` have shape
+        ``[num_reqs]`` and dtype ``torch.int32``.
+        """
+        if sampled_token_ids.dim() != 2:
+            raise ValueError(
+                f"Expected sampled_token_ids shape [num_reqs, max_sample_len], "
+                f"got {sampled_token_ids.shape}"
+            )
+        token_ids = sampled_token_ids.tolist()
+        return cls(
+            req_ids=req_ids,
+            sampled_token_ids=token_ids,
+            finish_reasons=[],
+            num_sampled=num_sampled.tolist(),
+            num_rejected=num_rejected.tolist(),
+        )
+
+    def to_tensors(
+        self,
+        device: torch.device | str,
+        num_reqs: int,
+        max_sample_len: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Reconstruct the V2 sampled-token tensors.
+
+        Returns ``(sampled_token_ids [num_reqs, max_sample_len] int64,
+        num_sampled [num_reqs] int32, num_rejected [num_reqs] int32)``.
+        """
+        sampled_tokens = torch.zeros(
+            (num_reqs, max_sample_len), dtype=torch.int64, device=device
+        )
+        if len(self.sampled_token_ids) != num_reqs:
+            raise ValueError(
+                f"Expected {num_reqs} sampled token entries, got "
+                f"{len(self.sampled_token_ids)}"
+            )
+        for i, ids in enumerate(self.sampled_token_ids):
+            if len(ids) > max_sample_len:
+                raise ValueError(
+                    f"Sampled token list at index {i} has length {len(ids)}, "
+                    f"exceeding max_sample_len={max_sample_len}"
+                )
+            sampled_tokens[i, : len(ids)] = torch.tensor(
+                ids, dtype=torch.int64, device=device
+            )
+
+        def _to_int32_tensor(values: list[int] | None) -> torch.Tensor:
+            tensor = torch.zeros((num_reqs,), dtype=torch.int32, device=device)
+            if values is not None:
+                if len(values) != num_reqs:
+                    raise ValueError(
+                        f"Expected {num_reqs} metadata entries, got {len(values)}"
+                    )
+                tensor.copy_(
+                    torch.tensor(values, dtype=torch.int32, device=device)
+                )
+            return tensor
+
+        return (
+            sampled_tokens,
+            _to_int32_tensor(self.num_sampled),
+            _to_int32_tensor(self.num_rejected),
+        )
 
 
 def _dtype_str_to_numpy(dtype_str: str) -> Any:

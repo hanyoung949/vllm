@@ -98,6 +98,7 @@ from vllm.v1.worker.gpu.mm.lora import set_active_mm_loras
 from vllm.v1.worker.gpu.model_states import init_model_state
 from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
 from vllm.v1.worker.gpu.pp_utils import PPHandler
+from vllm.v1.worker.gpu.split_pp_handler import SplitPPHandler
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
@@ -224,11 +225,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             device=self.device,
         )
         if self.use_pp:
-            self.pp_handler = PPHandler(
-                max_num_reqs=self.max_num_reqs,
-                num_speculative_steps=self.num_speculative_steps,
-                device=self.device,
-            )
+            if self.parallel_config.enable_layerwise_split:
+                self.pp_handler = SplitPPHandler(
+                    max_num_reqs=self.max_num_reqs,
+                    num_speculative_steps=self.num_speculative_steps,
+                    device=self.device,
+                )
+            else:
+                self.pp_handler = PPHandler(
+                    max_num_reqs=self.max_num_reqs,
+                    num_speculative_steps=self.num_speculative_steps,
+                    device=self.device,
+                )
 
         # Samplers and decode_query_len created in load_model() after
         # model_state exists (num_new_sampled_tokens_per_step from ModelState).

@@ -529,13 +529,14 @@ class VllmConfig:
 
     @property
     def use_v2_model_runner(self) -> bool:
-        # Layer-wise split is implemented on the V1 model runner.
-        if self.parallel_config.enable_layerwise_split:
-            return False
-
         use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
         if use_v2_model_runner is not None:
             return use_v2_model_runner
+
+        # Layer-wise split defaults to the V2 model runner; the split-specific
+        # sampled-token transport is implemented in SplitPPHandler.
+        if self.parallel_config.enable_layerwise_split:
+            return True
 
         # DSpark is implemented only by the V2 GPU model runner, and DeepSeek-V4
         # is not otherwise a default-V2 architecture, so force V2 for it. If V2
