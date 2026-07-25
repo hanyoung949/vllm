@@ -132,6 +132,9 @@ class SplitDVIDraftBlockGenerator:
         draft_ids_rows: list[torch.Tensor] = []  # d_{j+1} per substep
 
         draft_start_ns = time.perf_counter_ns()
+        ev_start = torch.cuda.Event(enable_timing=True)
+        ev_end = torch.cuda.Event(enable_timing=True)
+        ev_start.record()
         for j in range(k):
             positions_j = positions_all[j]
             positions_buf.copy_(positions_j)
@@ -197,6 +200,7 @@ class SplitDVIDraftBlockGenerator:
                 self.draft_head.predict_token_ids(hidden_j).to(torch.int32)
             )
         draft_ms = (time.perf_counter_ns() - draft_start_ns) / 1e6
+        ev_end.record()
 
         # Assemble the block in the expanded batch's row order (req-major,
         # position-minor): [k, R, H] -> [R, k, H] -> [R*k, H].
@@ -221,7 +225,8 @@ class SplitDVIDraftBlockGenerator:
 
         runtime = getattr(runner, "split_dvi_runtime", None)
         if runtime is not None and runtime.metrics is not None:
-            runtime.metrics.draft_cuda_ms += draft_ms
+            runtime.metrics.draft_wall_ms += draft_ms
+            runtime.metrics.record_draft_events(ev_start, ev_end)
 
         return SplitDVIDraftBlock(
             req_ids=list(input_batch.req_ids),

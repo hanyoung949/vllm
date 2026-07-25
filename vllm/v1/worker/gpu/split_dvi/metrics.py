@@ -52,11 +52,21 @@ class DVIMetrics:
     dvi_sampled_tokens: int = 0
     dvi_first_token_rejects: int = 0
 
-    draft_cuda_ms: float = 0.0
-    verify_cuda_ms: float = 0.0
+    # Host-side wall times (perf_counter); only fields measured with real
+    # CUDA events may carry "_cuda_ms" (draft_cuda_ms below).
+    draft_wall_ms: float = 0.0
+    verify_wall_ms: float = 0.0
     block_serialize_ms: float = 0.0
     block_bytes: int = 0
     cycle_wall_ms: float = 0.0
+    # Denominators for per-event averages: wall-clock cycles completed on
+    # this stage and DVI block packets serialized here (``cycles`` only
+    # counts stage_2 verifications, so it cannot serve for these).
+    wall_cycles: int = 0
+    block_count: int = 0
+    # stage_0 draft-loop GPU time from CUDA events; event pairs are read
+    # lazily at flush so per-cycle timing never forces a device sync.
+    _draft_events: list = field(default_factory=list, repr=False)
 
     _cycle_start_ns: int = field(default=0, repr=False)
     _last_flush_snapshot: tuple = field(
@@ -70,6 +80,20 @@ class DVIMetrics:
         if self._cycle_start_ns:
             self.cycle_wall_ms += (time.perf_counter_ns() - self._cycle_start_ns) / 1e6
             self._cycle_start_ns = 0
+            self.wall_cycles += 1
+
+    def record_draft_events(self, start, end) -> None:
+        """Stash a CUDA event pair bracketing the draft loop."""
+        self._draft_events.append((start, end))
+
+    def draft_cuda_ms(self) -> float:
+        """Sum of draft-loop GPU time (ms); syncs only when called (flush)."""
+        return sum(s.elapsed_time(e) for s, e in self._draft_events)
+
+    def record_block(self, num_bytes: int, serialize_ms: float) -> None:
+        self.block_bytes += num_bytes
+        self.block_serialize_ms += serialize_ms
+        self.block_count += 1
 
     def record_verification(
         self,
@@ -128,8 +152,8 @@ class DVIMetrics:
             self.fallback_cycles,
             self.verified_requests,
             self.sampled_tokens,
-            self.draft_cuda_ms,
-            self.verify_cuda_ms,
+            self.draft_wall_ms,
+            self.verify_wall_ms,
             self.block_serialize_ms,
             self.block_bytes,
             self.cycle_wall_ms,
@@ -143,8 +167,8 @@ class DVIMetrics:
             "DVI_METRICS stage=%s cycles=%d dvi_reqs=%d fallbacks=%d "
             "mean_advancement=%.3f first_token_reject_rate=%.3f "
             "mean_acceptance=%.3f sampled_hist=%s sampled_per_cycle=%.3f "
-            "draft_ms=%.1f verify_ms=%.1f cycle_wall_ms_avg=%.2f "
-            "block_bytes_avg=%.0f",
+            "cycle_wall_ms_avg=%.2f draft_wall_ms=%.1f draft_cuda_ms=%.1f "
+            "verify_wall_ms=%.1f block_serialize_ms=%.2f block_bytes_avg=%.0f",
             self.stage,
             self.cycles,
             self.verified_requests,
@@ -154,8 +178,10 @@ class DVIMetrics:
             self.mean_acceptance,
             dict(sorted(self.sampled_hist.items())),
             self.sampled_per_cycle,
-            self.draft_cuda_ms,
-            self.verify_cuda_ms,
-            self.cycle_wall_ms / max(self.cycles, 1),
-            self.block_bytes / max(self.cycles, 1),
+            self.cycle_wall_ms / max(self.wall_cycles, 1),
+            self.draft_wall_ms,
+            self.draft_cuda_ms(),
+            self.verify_wall_ms,
+            self.block_serialize_ms,
+            self.block_bytes / max(self.block_count, 1),
         )

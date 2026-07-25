@@ -30,6 +30,8 @@ def _runtime(tracker: SplitDVIStateTracker) -> SplitDVIRuntime:
     runtime.tracker = tracker
     runtime.policy_version = None
     runtime.draft_version = None
+    runtime.is_first_stage = False
+    runtime.metrics = None
     return runtime
 
 

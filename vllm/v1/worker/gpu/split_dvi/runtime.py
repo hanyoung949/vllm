@@ -25,6 +25,7 @@ Step kinds (all stages classify identically from the same SchedulerOutput):
 from __future__ import annotations
 
 import enum
+import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -245,6 +246,11 @@ class SplitDVIRuntime:
         self.on_model_loaded()
         k = self.runner.num_speculative_steps + 1
         cycle_ids = self.tracker.cycle_ids_for(list(input_batch.req_ids))
+        if self.metrics is not None:
+            # cycle wall clock starts here (host monotonic, stage_0 only);
+            # it ends when the answering token packet arrives back at this
+            # rank (see validate_token_packet).
+            self.metrics.cycle_start()
         block = self._generator.generate(input_batch, k, cycle_ids)
         self._outgoing_metadata = {
             "packet_kind": "dvi_block",
@@ -423,6 +429,20 @@ class SplitDVIRuntime:
         """Verify the DVI block on stage_2 and package a native-looking
         sampler output plus the DVI token-packet extras."""
         assert self.is_last_stage and self._verifier is not None
+        t0 = time.perf_counter_ns()
+        try:
+            return self._verify_block(hidden_states, input_batch)
+        finally:
+            if self.metrics is not None:
+                self.metrics.verify_wall_ms += (
+                    time.perf_counter_ns() - t0
+                ) / 1e6
+
+    def _verify_block(
+        self,
+        hidden_states: torch.Tensor,
+        input_batch: "InputBatch",
+    ) -> DVIBlockResult:
         if not self._incoming_is_dvi_block or self._incoming_metadata is None:
             raise SplitDVIProtocolError("verify_block called without an incoming DVI block")
 
@@ -522,6 +542,15 @@ class SplitDVIRuntime:
         # awaiting flag in abnormal states.
         for req_id in awaiting_ids:
             self.tracker.mark_result_received(req_id)
+        if self.is_first_stage and self.metrics is not None:
+            # The answering token packet just arrived back at stage_0:
+            # close the cycle wall clock started in generate_draft_block.
+            self.metrics.cycle_end()
+
+    def note_block_serialized(self, serialize_ms: float, num_bytes: int) -> None:
+        """Metrics sink for the split tensor transport (DVI block packets)."""
+        if self.metrics is not None:
+            self.metrics.record_block(num_bytes, serialize_ms)
 
     def note_dvi_result_received(self, req_ids: list[str]) -> None:
         """Mark DVI results as received without validating them.

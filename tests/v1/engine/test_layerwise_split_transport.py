@@ -172,3 +172,35 @@ def test_zmq_star_token_broadcast():
         s0.close()
         s1.close()
         s2.close()
+
+
+def test_dvi_block_send_reports_serialize_metrics():
+    """The DVI metrics sink fires for DVI block packets only (not NORMAL)."""
+    import threading
+    from unittest import mock
+
+    def _bare_transport(sink):
+        t = ZmqSplitActivationTransport.__new__(ZmqSplitActivationTransport)
+        t._tensor_send = mock.Mock()
+        t._lock = threading.Lock()
+        t._stage_label = "PP0"
+        t.dvi_metrics_sink = sink
+        return t
+
+    packet = mock.Mock()
+    packet.is_dvi_block = True
+    packet.serialize.return_value = [b"abc", b"defg"]
+
+    sink = mock.Mock()
+    _bare_transport(sink).send_tensor_packet(packet)
+    sink.assert_called_once()
+    serialize_ms, num_bytes = sink.call_args[0]
+    assert serialize_ms >= 0.0
+    assert num_bytes == 7
+
+    normal = mock.Mock()
+    normal.is_dvi_block = False
+    normal.serialize.return_value = [b"x"]
+    sink2 = mock.Mock()
+    _bare_transport(sink2).send_tensor_packet(normal)
+    sink2.assert_not_called()

@@ -17,6 +17,7 @@ Deferred:
 from __future__ import annotations
 
 import threading
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
@@ -112,6 +113,9 @@ class ZmqSplitActivationTransport(SplitActivationTransport):
         self._tensor_send: zmq.Socket | None = None
         self._token_recv: zmq.Socket | None = None
         self._token_sends: list[zmq.Socket] = []
+        # Optional Stage-DVI metrics sink: called with (serialize_ms, bytes)
+        # for each DVI block tensor packet; wired by the model runner.
+        self.dvi_metrics_sink = None
 
         # Tensor sockets.
         if endpoints.tensor_recv_addr:
@@ -135,7 +139,13 @@ class ZmqSplitActivationTransport(SplitActivationTransport):
             raise RuntimeError(
                 f"Stage {self._stage_label} is not configured to send tensor packets."
             )
+        t0 = time.perf_counter_ns()
         frames = packet.serialize()
+        if packet.is_dvi_block and self.dvi_metrics_sink is not None:
+            self.dvi_metrics_sink(
+                (time.perf_counter_ns() - t0) / 1e6,
+                sum(len(f) for f in frames),
+            )
         with self._lock:
             self._tensor_send.send_multipart(frames)
 

@@ -59,6 +59,28 @@ def test_flush_emits_again_after_fallback_only_mutation(monkeypatch):
     assert len(calls) == 2
 
 
+def test_record_block_accumulates():
+    m = DVIMetrics(stage="stage_0")
+    m.record_block(1024, 0.5)
+    m.record_block(2048, 1.5)
+    assert m.block_bytes == 3072
+    assert m.block_serialize_ms == 2.0
+
+
+def test_draft_events_lazy_sum():
+    class _Ev:
+        def __init__(self, ms):
+            self.ms = ms
+
+        def elapsed_time(self, other):
+            return other.ms - self.ms
+
+    m = DVIMetrics(stage="stage_0")
+    m.record_draft_events(_Ev(0), _Ev(3))
+    m.record_draft_events(_Ev(0), _Ev(7))
+    assert m.draft_cuda_ms() == 10.0
+
+
 def test_flush_emits_again_after_timing_only_mutation(monkeypatch):
     calls = []
 

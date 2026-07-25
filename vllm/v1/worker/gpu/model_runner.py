@@ -265,6 +265,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.pp_handler.dvi_result_notifier = (
                     self.split_dvi_runtime.note_dvi_result_received
                 )
+                transport = getattr(self.pp_handler._split_pp, "_transport", None)
+                if transport is not None:
+                    transport.dvi_metrics_sink = (
+                        self.split_dvi_runtime.note_block_serialized
+                    )
 
         # Samplers and decode_query_len created in load_model() after
         # model_state exists (num_new_sampled_tokens_per_step from ModelState).
