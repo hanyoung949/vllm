@@ -178,18 +178,22 @@ class ZmqSplitActivationTransport(SplitActivationTransport):
         return SplitTokenPacket.deserialize(data)
 
     def close(self) -> None:
-        if self._closed:
+        # getattr throughout: safe on partially constructed instances
+        # (bind failure mid-init, or bare test doubles).
+        if getattr(self, "_closed", True):
             return
         self._closed = True
         for sock in (
-            self._tensor_recv,
-            self._tensor_send,
-            self._token_recv,
-            *self._token_sends,
+            getattr(self, "_tensor_recv", None),
+            getattr(self, "_tensor_send", None),
+            getattr(self, "_token_recv", None),
+            *getattr(self, "_token_sends", ()),
         ):
             if sock is not None:
                 sock.close()
-        self._context.term()
+        context = getattr(self, "_context", None)
+        if context is not None:
+            context.term()
 
     def __del__(self) -> None:
         self.close()

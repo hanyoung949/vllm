@@ -64,31 +64,48 @@ class DVIMetrics:
     # counts stage_2 verifications, so it cannot serve for these).
     wall_cycles: int = 0
     block_count: int = 0
-    # stage_0 draft-loop GPU time from CUDA events; event pairs are read
-    # lazily at flush so per-cycle timing never forces a device sync.
+    # stage_0 draft-loop GPU time from CUDA events; pairs are settled
+    # eagerly via non-blocking query so the list stays bounded, and only
+    # unsettled pairs are read (sync) at flush time.
     _draft_events: list = field(default_factory=list, repr=False)
+    _draft_cuda_settled_ms: float = field(default=0.0, repr=False)
+    # Wall-clock cycles are keyed by (req_ids, cycle_ids): with several
+    # requests' DVI blocks in flight, a single start slot would silently
+    # overwrite.  Leftover keys at flush indicate an unanswered block.
+    _pending_wall: dict = field(default_factory=dict, repr=False)
 
-    _cycle_start_ns: int = field(default=0, repr=False)
     _last_flush_snapshot: tuple = field(
         default=(0, 0, 0, 0, 0.0, 0.0, 0.0, 0, 0.0), repr=False
     )
 
-    def cycle_start(self) -> None:
-        self._cycle_start_ns = time.perf_counter_ns()
+    def cycle_start(self, req_ids: list, cycle_ids: list) -> None:
+        key = (tuple(req_ids), tuple(cycle_ids))
+        self._pending_wall[key] = time.perf_counter_ns()
 
-    def cycle_end(self) -> None:
-        if self._cycle_start_ns:
-            self.cycle_wall_ms += (time.perf_counter_ns() - self._cycle_start_ns) / 1e6
-            self._cycle_start_ns = 0
+    def cycle_end(self, req_ids: list, cycle_ids: list) -> None:
+        key = (tuple(req_ids), tuple(cycle_ids))
+        start = self._pending_wall.pop(key, None)
+        if start is not None:
+            self.cycle_wall_ms += (time.perf_counter_ns() - start) / 1e6
             self.wall_cycles += 1
 
     def record_draft_events(self, start, end) -> None:
-        """Stash a CUDA event pair bracketing the draft loop."""
+        """Stash a CUDA event pair and eagerly settle completed ones."""
         self._draft_events.append((start, end))
+        remaining = []
+        for s, e in self._draft_events:
+            if e.query():
+                self._draft_cuda_settled_ms += s.elapsed_time(e)
+            else:
+                remaining.append((s, e))
+        # Hard cap as a safety net (e.g. events orphaned by an abort).
+        self._draft_events = remaining[-128:]
 
     def draft_cuda_ms(self) -> float:
-        """Sum of draft-loop GPU time (ms); syncs only when called (flush)."""
-        return sum(s.elapsed_time(e) for s, e in self._draft_events)
+        """Total draft-loop GPU time (ms); syncs only on unsettled events."""
+        return self._draft_cuda_settled_ms + sum(
+            s.elapsed_time(e) for s, e in self._draft_events
+        )
 
     def record_block(self, num_bytes: int, serialize_ms: float) -> None:
         self.block_bytes += num_bytes
@@ -167,8 +184,9 @@ class DVIMetrics:
             "DVI_METRICS stage=%s cycles=%d dvi_reqs=%d fallbacks=%d "
             "mean_advancement=%.3f first_token_reject_rate=%.3f "
             "mean_acceptance=%.3f sampled_hist=%s sampled_per_cycle=%.3f "
-            "cycle_wall_ms_avg=%.2f draft_wall_ms=%.1f draft_cuda_ms=%.1f "
-            "verify_wall_ms=%.1f block_serialize_ms=%.2f block_bytes_avg=%.0f",
+            "cycle_wall_ms_avg=%.2f unclosed_wall=%d draft_wall_ms=%.1f "
+            "draft_cuda_ms=%.1f verify_wall_ms=%.1f block_serialize_ms=%.2f "
+            "block_bytes_avg=%.0f",
             self.stage,
             self.cycles,
             self.verified_requests,
@@ -179,6 +197,7 @@ class DVIMetrics:
             dict(sorted(self.sampled_hist.items())),
             self.sampled_per_cycle,
             self.cycle_wall_ms / max(self.wall_cycles, 1),
+            len(self._pending_wall),
             self.draft_wall_ms,
             self.draft_cuda_ms(),
             self.verify_wall_ms,

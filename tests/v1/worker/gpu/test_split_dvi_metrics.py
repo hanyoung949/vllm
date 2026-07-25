@@ -67,18 +67,45 @@ def test_record_block_accumulates():
     assert m.block_serialize_ms == 2.0
 
 
-def test_draft_events_lazy_sum():
+def test_draft_events_settle_and_cap():
     class _Ev:
-        def __init__(self, ms):
+        def __init__(self, ms, done=True):
             self.ms = ms
+            self.done = done
+
+        def query(self):
+            return self.done
 
         def elapsed_time(self, other):
             return other.ms - self.ms
 
     m = DVIMetrics(stage="stage_0")
-    m.record_draft_events(_Ev(0), _Ev(3))
-    m.record_draft_events(_Ev(0), _Ev(7))
+    m.record_draft_events(_Ev(0), _Ev(3))  # completes -> settled eagerly
+    m.record_draft_events(_Ev(0), _Ev(7, done=False))  # stays pending
+    assert m._draft_cuda_settled_ms == 3.0
+    assert len(m._draft_events) == 1
     assert m.draft_cuda_ms() == 10.0
+    # Hard cap keeps the list bounded even if events never complete.
+    for _ in range(200):
+        m.record_draft_events(_Ev(0, done=False), _Ev(1, done=False))
+    assert len(m._draft_events) <= 128
+
+
+def test_cycle_wall_keyed_pairing():
+    m = DVIMetrics(stage="stage_0")
+    # Interleaved blocks for different requests must pair correctly.
+    m.cycle_start(["a"], [1])
+    m.cycle_start(["b"], [1])
+    m.cycle_end(["b"], [1])
+    m.cycle_end(["a"], [1])
+    assert m.wall_cycles == 2
+    assert len(m._pending_wall) == 0
+    # Unanswered block stays pending (reported as unclosed at flush).
+    m.cycle_start(["c"], [1])
+    assert len(m._pending_wall) == 1
+    # Unknown key: no-op, no crash.
+    m.cycle_end(["ghost"], [9])
+    assert m.wall_cycles == 2
 
 
 def test_flush_emits_again_after_timing_only_mutation(monkeypatch):
@@ -97,8 +124,8 @@ def test_flush_emits_again_after_timing_only_mutation(monkeypatch):
     assert len(calls) == 1
     # A timing-only mutation (cycle_end after the periodic flush) changes the
     # log line and must not be suppressed at shutdown.
-    m.cycle_start()
-    m.cycle_end()
+    m.cycle_start(["r0"], [1])
+    m.cycle_end(["r0"], [1])
     m.flush()
     assert len(calls) == 2
 
