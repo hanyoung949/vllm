@@ -47,6 +47,7 @@ from .profiler import ProfilerConfig
 from .reasoning import ReasoningConfig
 from .scheduler import SchedulerConfig
 from .speculative import EagleModelTypes, NgramGPUTypes, SpeculativeConfig
+from .split_dvi import SplitDVIConfig, materialize_split_dvi_speculative_config
 from .structured_outputs import StructuredOutputsConfig
 from .utils import SupportsHash, config, replace
 from .weight_transfer import WeightTransferConfig
@@ -318,6 +319,11 @@ class VllmConfig:
     """LoRA configuration."""
     speculative_config: SpeculativeConfig | None = None
     """Speculative decoding configuration."""
+    split_dvi_config: "SplitDVIConfig | None" = None
+    """Stage-DVI (distributed draft/verify) configuration for layer-wise
+    split. When enabled, an internal SpeculativeConfig with
+    method="split_dvi" is materialized to drive the scheduler-side
+    spec-decode bookkeeping; no draft model or speculator is created."""
     diffusion_config: DiffusionConfig | None = None
     """Diffusion LLM (dLLM) configuration."""
 
@@ -955,6 +961,19 @@ class VllmConfig:
 
         self.try_verify_and_update_config()
 
+        if self.split_dvi_config is not None and self.split_dvi_config.enabled:
+            # Materialize the internal SpeculativeConfig that drives the
+            # scheduler-side spec-decode bookkeeping for Stage-DVI before the
+            # async-scheduling compatibility checks below inspect its method.
+            if self.speculative_config is None:
+                if self.model_config is None:
+                    raise ValueError(
+                        "SplitDVI requires a target model config to be present"
+                    )
+                self.speculative_config = materialize_split_dvi_speculative_config(
+                    self.split_dvi_config, self.model_config, self.parallel_config
+                )
+
         if self.model_config is not None:
             self.model_config.verify_with_parallel_config(self.parallel_config)
             self.model_config.verify_dual_chunk_attention_config(self.load_config)
@@ -1052,6 +1071,7 @@ class VllmConfig:
                     and self.speculative_config.method not in get_args(NgramGPUTypes)
                     and self.speculative_config.method != "draft_model"
                     and self.speculative_config.method != "dspark"
+                    and self.speculative_config.method != "split_dvi"
                 ):
                     raise ValueError(
                         "Currently, async scheduling is only supported "
@@ -1084,6 +1104,7 @@ class VllmConfig:
                 and self.speculative_config.method not in get_args(EagleModelTypes)
                 and self.speculative_config.method not in get_args(NgramGPUTypes)
                 and self.speculative_config.method != "dspark"
+                and self.speculative_config.method != "split_dvi"
             ):
                 logger.warning_once(
                     "Async scheduling not supported with %s-based "
@@ -1116,6 +1137,12 @@ class VllmConfig:
                 self.scheduler_config.async_scheduling = False
             else:
                 self.scheduler_config.async_scheduling = True
+
+        if self.split_dvi_config is not None and self.split_dvi_config.enabled:
+            # Now that async scheduling and the runner version are resolved,
+            # run the cross-config consistency checks (split topology, V2
+            # runner, async cadence, speculative method conflicts).
+            self.split_dvi_config.validate_against_vllm_config(self)
 
         logger.info_once(
             "Asynchronous scheduling is %s.",
@@ -2160,6 +2187,7 @@ class VllmConfig:
                 "mtp",
                 "dflash",
                 "dspark",
+                "split_dvi",
             ):
                 unsupported.append(f"speculative method '{speculative_config.method}'")
 

@@ -65,6 +65,7 @@ from vllm.config import (
     WeightTransferConfig,
     get_attr_docs,
 )
+from vllm.config.split_dvi import SplitDVIConfig
 from vllm.config.cache import (
     CacheDType,
     KVOffloadingBackend,
@@ -637,6 +638,7 @@ class EngineArgs:
     spec_method: str | None = None
     spec_model: str | None = None
     spec_tokens: int | None = None
+    split_dvi_config: dict[str, Any] | None = None
     diffusion_config: dict[str, Any] | None = None
 
     show_hidden_metrics_for_version: str | None = (
@@ -1558,6 +1560,10 @@ class EngineArgs:
         vllm_group.add_argument(
             "--spec-tokens", **speculative_kwargs["num_speculative_tokens"]
         )
+        vllm_kwargs["split_dvi_config"]["type"] = optional_type(json.loads)
+        vllm_group.add_argument(
+            "--split-dvi-config", **vllm_kwargs["split_dvi_config"]
+        )
         vllm_kwargs["diffusion_config"]["type"] = optional_type(json.loads)
         vllm_group.add_argument(
             "--diffusion-config", "-dc", **vllm_kwargs["diffusion_config"]
@@ -2175,6 +2181,11 @@ class EngineArgs:
             target_model_config=model_config,
             target_parallel_config=parallel_config,
         )
+        split_dvi_config = (
+            SplitDVIConfig(**self.split_dvi_config)
+            if self.split_dvi_config is not None
+            else None
+        )
         diffusion_config = self.create_diffusion_config()
 
         self._set_default_max_num_seqs_and_batched_tokens_args(
@@ -2394,6 +2405,7 @@ class EngineArgs:
             kernel_config=kernel_config,
             lora_config=lora_config,
             speculative_config=speculative_config,
+            split_dvi_config=split_dvi_config,
             diffusion_config=diffusion_config,
             structured_outputs_config=self.structured_outputs_config,
             observability_config=observability_config,

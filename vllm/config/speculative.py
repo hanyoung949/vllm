@@ -68,6 +68,7 @@ SpeculativeMethod = Literal[
     "draft_model",
     "suffix",
     "custom_class",
+    "split_dvi",
     EagleModelTypes,
     NgramGPUTypes,
     DSparkModelTypes,
@@ -694,6 +695,10 @@ class SpeculativeConfig:
                         "method='custom_class' requires 'model' to contain the "
                         "custom proposer module path (e.g., 'my_module.MyProposer')."
                     )
+            elif self.method == "split_dvi":
+                # Stage-DVI needs no draft model: the draft head lives on
+                # split stage_0 and drafts travel inside split packets.
+                self.model = "split_dvi"
             else:
                 raise ValueError(
                     "num_speculative_tokens was provided but without speculative model."
@@ -745,6 +750,15 @@ class SpeculativeConfig:
                 "experimental feature and the proposer interface is subject to "
                 "breaking changes in future vLLM releases."
             )
+            self.prompt_lookup_max = 0
+            self.prompt_lookup_min = 0
+            self.draft_model_config = self.target_model_config
+            self.draft_parallel_config = self.target_parallel_config
+        elif self.method == "split_dvi":
+            # Stage-DVI: no draft model is loaded anywhere.  The scheduler-
+            # side bookkeeping (placeholder spec tokens, KV allocation and
+            # output reconciliation) only needs num_speculative_tokens; the
+            # target configs are carried for KV-cache shape bookkeeping.
             self.prompt_lookup_max = 0
             self.prompt_lookup_min = 0
             self.draft_model_config = self.target_model_config
@@ -1296,6 +1310,7 @@ class SpeculativeConfig:
                 "suffix",
                 "extract_hidden_states",
                 "custom_class",
+                "split_dvi",
             )
             else self.draft_model_config.model
         )

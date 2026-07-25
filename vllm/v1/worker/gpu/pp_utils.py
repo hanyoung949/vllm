@@ -43,8 +43,20 @@ def compute_need_sampled_mask(input_batch: InputBatch) -> np.ndarray | None:
     assert max_seq_len is not None  # always populated under PP
     # Exclude non-final prefill chunks (they don't produce a sample).
     produces_sample = old_computed + input_batch.num_scheduled_tokens >= prefill_len
-    # Exclude requests that we know are finished.
-    not_finishing = np.maximum(old_computed, prefill_len) + 1 < max_seq_len
+    # Exclude requests that we know are finished.  With multi-token steps
+    # (spec decode / Stage-DVI), `old_computed` may carry scheduler-async
+    # optimism: the scheduler books num_scheduled tokens per step and only
+    # later reconciles rejections (num_rejected <= num_scheduled - 1 since
+    # at least one token is always committed).  Subtract that maximum
+    # possible rollback so the mask stays permissive; over-receiving a tail
+    # packet is harmless (filtered on apply), under-receiving desyncs the
+    # non-last stages' request state.
+    not_finishing = (
+        np.maximum(old_computed, prefill_len)
+        - (input_batch.num_scheduled_tokens - 1)
+        + 1
+        < max_seq_len
+    )
     need_sampled_mask = produces_sample & not_finishing
     return need_sampled_mask if need_sampled_mask.any() else None
 

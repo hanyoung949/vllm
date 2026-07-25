@@ -15,6 +15,7 @@ metadata (KV cache is not transferred across stages).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any
 
 import msgspec
@@ -22,6 +23,18 @@ import numpy as np
 import torch
 
 from vllm.sequence import IntermediateTensors
+
+
+class SplitPacketKind(str, Enum):
+    """Kind of a split tensor/token packet.
+
+    NORMAL: baseline per-step packets (single boundary forward).
+    DVI_BLOCK: Stage-DVI draft/verify block packets carrying draft metadata
+    alongside the per-position intermediate tensors.
+    """
+
+    NORMAL = "normal"
+    DVI_BLOCK = "dvi_block"
 
 
 class _TensorDescriptor(msgspec.Struct, array_like=True):
@@ -40,6 +53,17 @@ class _SplitTensorPacketSerialized(msgspec.Struct):
     num_scheduled_tokens: list[int]
     is_prompt: bool
     descriptors: list[_TensorDescriptor]
+    packet_kind: str = SplitPacketKind.NORMAL.value
+    # DVI block metadata (present iff packet_kind == DVI_BLOCK).
+    cycle_ids: list[int] | None = None
+    draft_token_ids: list[int] | None = None
+    draft_lengths: list[int] | None = None
+    # Schema v2: lifecycle epoch per request (scheduler-issued), block-row
+    # positions, and version contracts (unversioned in v1).
+    generation_ids: list[int] | None = None
+    draft_positions: list[int] | None = None
+    policy_version: str | None = None
+    draft_version: str | None = None
 
 
 @dataclass
@@ -49,12 +73,32 @@ class SplitTensorPacket:
     Contains the intermediate activation tensors (hidden_states + residual) plus
     the minimal metadata needed by the receiving stage to reconstruct the input
     batch.
+
+    Stage-DVI: when ``packet_kind == DVI_BLOCK`` the tensors hold the full
+    draft block (one row per draft position, ``sum(num_scheduled_tokens)``
+    rows) and the DVI metadata fields describe the block: ``cycle_ids`` per
+    request, ``draft_token_ids`` (flat, ``sum(draft_lengths)`` entries) and
+    ``draft_lengths`` per request.  ``draft_lengths[r]`` equals the number of
+    logit rows for decode requests (k proposals) and 0 for prefilling ones.
     """
 
     req_ids: list[str]
     num_scheduled_tokens: list[int]
     is_prompt: bool
     tensors: dict[str, torch.Tensor] = field(default_factory=dict)
+    packet_kind: str = SplitPacketKind.NORMAL.value
+    cycle_ids: list[int] | None = None
+    draft_token_ids: list[int] | None = None
+    draft_lengths: list[int] | None = None
+    # Schema v2 fields.
+    generation_ids: list[int] | None = None
+    draft_positions: list[int] | None = None
+    policy_version: str | None = None
+    draft_version: str | None = None
+
+    @property
+    def is_dvi_block(self) -> bool:
+        return self.packet_kind == SplitPacketKind.DVI_BLOCK.value
 
     def to_intermediate_tensors(self) -> IntermediateTensors:
         return IntermediateTensors(self.tensors)
@@ -66,13 +110,137 @@ class SplitTensorPacket:
         num_scheduled_tokens: list[int],
         is_prompt: bool,
         intermediate_tensors: IntermediateTensors,
+        packet_kind: str = SplitPacketKind.NORMAL.value,
+        cycle_ids: list[int] | None = None,
+        draft_token_ids: list[int] | None = None,
+        draft_lengths: list[int] | None = None,
+        generation_ids: list[int] | None = None,
+        draft_positions: list[int] | None = None,
+        policy_version: str | None = None,
+        draft_version: str | None = None,
     ) -> "SplitTensorPacket":
         return cls(
             req_ids=req_ids,
             num_scheduled_tokens=num_scheduled_tokens,
             is_prompt=is_prompt,
             tensors=intermediate_tensors.tensors,
+            packet_kind=packet_kind,
+            cycle_ids=cycle_ids,
+            draft_token_ids=draft_token_ids,
+            draft_lengths=draft_lengths,
+            generation_ids=generation_ids,
+            draft_positions=draft_positions,
+            policy_version=policy_version,
+            draft_version=draft_version,
         )
+
+    def validate(
+        self,
+        expected_req_ids: list[str] | None = None,
+        vocab_size: int | None = None,
+        max_draft_length: int | None = None,
+    ) -> None:
+        """Fail-fast structural validation.  Any inconsistency indicates
+        cross-stage desync, so raise immediately instead of guessing."""
+        if expected_req_ids is not None and self.req_ids != expected_req_ids:
+            raise ValueError(
+                f"SplitTensorPacket req_ids mismatch: expected "
+                f"{expected_req_ids!r}, got {self.req_ids!r}"
+            )
+        if len(self.req_ids) != len(self.num_scheduled_tokens):
+            raise ValueError(
+                f"SplitTensorPacket req_ids/num_scheduled_tokens length "
+                f"mismatch: {len(self.req_ids)} vs "
+                f"{len(self.num_scheduled_tokens)}"
+            )
+        if not self.is_dvi_block:
+            if (
+                self.cycle_ids is not None
+                or self.draft_token_ids is not None
+                or self.draft_lengths is not None
+                or self.generation_ids is not None
+                or self.draft_positions is not None
+                or self.policy_version is not None
+                or self.draft_version is not None
+            ):
+                raise ValueError(
+                    "SplitTensorPacket kind is NORMAL but DVI metadata is set"
+                )
+            return
+
+        # DVI block validation.
+        if self.cycle_ids is None or self.draft_lengths is None:
+            raise ValueError("DVI block packet missing cycle_ids/draft_lengths")
+        if self.draft_token_ids is None:
+            raise ValueError("DVI block packet missing draft_token_ids")
+        if self.generation_ids is None:
+            raise ValueError("DVI block packet missing generation_ids")
+        if self.draft_positions is None:
+            raise ValueError("DVI block packet missing draft_positions")
+        if len(self.cycle_ids) != len(self.req_ids):
+            raise ValueError(
+                f"DVI block cycle_ids length {len(self.cycle_ids)} != "
+                f"num reqs {len(self.req_ids)}"
+            )
+        if len(self.generation_ids) != len(self.req_ids):
+            raise ValueError(
+                f"DVI block generation_ids length {len(self.generation_ids)} "
+                f"!= num reqs {len(self.req_ids)}"
+            )
+        for gen_id in self.generation_ids:
+            if gen_id < 0:
+                raise ValueError(f"Negative generation_id {gen_id}")
+        for cycle_id in self.cycle_ids:
+            if cycle_id < 0:
+                raise ValueError(f"Negative cycle_id {cycle_id}")
+        if len(self.draft_lengths) != len(self.req_ids):
+            raise ValueError(
+                f"DVI block draft_lengths length {len(self.draft_lengths)} != "
+                f"num reqs {len(self.req_ids)}"
+            )
+        if sum(self.draft_lengths) != len(self.draft_token_ids):
+            raise ValueError(
+                f"DVI block draft_token_ids has {len(self.draft_token_ids)} "
+                f"entries but draft_lengths sum to {sum(self.draft_lengths)}"
+            )
+        if len(self.draft_positions) != len(self.draft_token_ids):
+            raise ValueError(
+                f"DVI block draft_positions has {len(self.draft_positions)} "
+                f"entries but draft_token_ids has {len(self.draft_token_ids)}"
+            )
+        for draft_len in self.draft_lengths:
+            if draft_len < 0:
+                raise ValueError(f"Negative draft_length {draft_len}")
+            if max_draft_length is not None and draft_len > max_draft_length:
+                raise ValueError(
+                    f"draft_length {draft_len} exceeds max_draft_length "
+                    f"{max_draft_length}"
+                )
+        # Per-request draft positions must be strictly increasing.
+        offset = 0
+        for r, draft_len in enumerate(self.draft_lengths):
+            segment = self.draft_positions[offset : offset + draft_len]
+            for i in range(1, len(segment)):
+                if segment[i] <= segment[i - 1]:
+                    raise ValueError(
+                        f"DVI block draft_positions for req {r} not strictly "
+                        f"increasing: {segment}"
+                    )
+            offset += draft_len
+        if vocab_size is not None:
+            for token_id in self.draft_token_ids:
+                if not 0 <= token_id < vocab_size:
+                    raise ValueError(
+                        f"Draft token id {token_id} out of vocab range "
+                        f"[0, {vocab_size})"
+                    )
+        num_rows = sum(self.num_scheduled_tokens)
+        for key, tensor in self.tensors.items():
+            if tensor.shape[0] != num_rows:
+                raise ValueError(
+                    f"DVI block tensor {key!r} has {tensor.shape[0]} rows, "
+                    f"expected {num_rows}"
+                )
 
     def serialize(self) -> list[bytes]:
         """Serialize to ZMQ-style multipart message.
@@ -109,6 +277,14 @@ class SplitTensorPacket:
             num_scheduled_tokens=self.num_scheduled_tokens,
             is_prompt=self.is_prompt,
             descriptors=descriptors,
+            packet_kind=self.packet_kind,
+            cycle_ids=self.cycle_ids,
+            draft_token_ids=self.draft_token_ids,
+            draft_lengths=self.draft_lengths,
+            generation_ids=self.generation_ids,
+            draft_positions=self.draft_positions,
+            policy_version=self.policy_version,
+            draft_version=self.draft_version,
         )
         metadata_bytes = msgspec.msgpack.encode(metadata)
 
@@ -149,6 +325,14 @@ class SplitTensorPacket:
             num_scheduled_tokens=metadata.num_scheduled_tokens,
             is_prompt=metadata.is_prompt,
             tensors=tensors,
+            packet_kind=metadata.packet_kind,
+            cycle_ids=metadata.cycle_ids,
+            draft_token_ids=metadata.draft_token_ids,
+            draft_lengths=metadata.draft_lengths,
+            generation_ids=metadata.generation_ids,
+            draft_positions=metadata.draft_positions,
+            policy_version=metadata.policy_version,
+            draft_version=metadata.draft_version,
         )
 
 
@@ -159,6 +343,12 @@ class SplitTokenPacket:
     Contains the sampled tokens and optional per-request metadata
     (``num_sampled``, ``num_rejected``) needed by the V2 model runner.
     Logprobs and other optional fields are left out in Phase 1.
+
+    Stage-DVI: ``cycle_ids`` echoes the DVI block cycle each answer belongs
+    to (used for fail-fast cross-stage desync detection) and
+    ``accepted_counts`` records how many draft tokens were accepted per
+    request (debug/metrics only; the commit semantics are driven by
+    ``num_sampled``/``num_rejected``).
     """
 
     req_ids: list[str]
@@ -166,17 +356,39 @@ class SplitTokenPacket:
     finish_reasons: list[str | None] = field(default_factory=list)
     num_sampled: list[int] | None = None
     num_rejected: list[int] | None = None
+    packet_kind: str = SplitPacketKind.NORMAL.value
+    cycle_ids: list[int] | None = None
+    accepted_counts: list[int] | None = None
+    # Schema v2 echo fields: must match the DVI block they answer.
+    generation_ids: list[int] | None = None
+    policy_version: str | None = None
+    draft_version: str | None = None
+
+    @property
+    def is_dvi_block(self) -> bool:
+        return self.packet_kind == SplitPacketKind.DVI_BLOCK.value
 
     def serialize(self) -> bytes:
         data: dict[str, Any] = {
             "req_ids": self.req_ids,
             "sampled_token_ids": self.sampled_token_ids,
             "finish_reasons": self.finish_reasons,
+            "packet_kind": self.packet_kind,
         }
         if self.num_sampled is not None:
             data["num_sampled"] = self.num_sampled
         if self.num_rejected is not None:
             data["num_rejected"] = self.num_rejected
+        if self.cycle_ids is not None:
+            data["cycle_ids"] = self.cycle_ids
+        if self.accepted_counts is not None:
+            data["accepted_counts"] = self.accepted_counts
+        if self.generation_ids is not None:
+            data["generation_ids"] = self.generation_ids
+        if self.policy_version is not None:
+            data["policy_version"] = self.policy_version
+        if self.draft_version is not None:
+            data["draft_version"] = self.draft_version
         return msgspec.msgpack.encode(data)
 
     @classmethod
@@ -188,6 +400,12 @@ class SplitTokenPacket:
             finish_reasons=decoded.get("finish_reasons", []),
             num_sampled=decoded.get("num_sampled"),
             num_rejected=decoded.get("num_rejected"),
+            packet_kind=decoded.get("packet_kind", SplitPacketKind.NORMAL.value),
+            cycle_ids=decoded.get("cycle_ids"),
+            accepted_counts=decoded.get("accepted_counts"),
+            generation_ids=decoded.get("generation_ids"),
+            policy_version=decoded.get("policy_version"),
+            draft_version=decoded.get("draft_version"),
         )
 
     @classmethod
@@ -237,6 +455,12 @@ class SplitTokenPacket:
         sampled_token_ids: torch.Tensor,
         num_sampled: torch.Tensor,
         num_rejected: torch.Tensor,
+        packet_kind: str = SplitPacketKind.NORMAL.value,
+        cycle_ids: list[int] | None = None,
+        accepted_counts: list[int] | None = None,
+        generation_ids: list[int] | None = None,
+        policy_version: str | None = None,
+        draft_version: str | None = None,
     ) -> "SplitTokenPacket":
         """Create a packet from the V2 model runner's sampled-token tensors.
 
@@ -256,6 +480,12 @@ class SplitTokenPacket:
             finish_reasons=[],
             num_sampled=num_sampled.tolist(),
             num_rejected=num_rejected.tolist(),
+            packet_kind=packet_kind,
+            cycle_ids=cycle_ids,
+            accepted_counts=accepted_counts,
+            generation_ids=generation_ids,
+            policy_version=policy_version,
+            draft_version=draft_version,
         )
 
     def validate_req_ids(self, expected_req_ids: list[str]) -> None:
@@ -268,6 +498,93 @@ class SplitTokenPacket:
             raise ValueError(
                 f"SplitTokenPacket req_ids mismatch: expected "
                 f"{expected_req_ids!r}, got {self.req_ids!r}"
+            )
+
+    def validate_dvi(
+        self,
+        expected_cycle_ids: list[int] | None = None,
+        expected_generation_ids: list[int] | None = None,
+        expected_policy_version: str | None = None,
+        expected_draft_version: str | None = None,
+    ) -> None:
+        """Fail-fast validation of DVI token packet semantics.
+
+        The ``expected_*`` parameters pin the packet to the block it must
+        answer: local per-request cycle counters, scheduler-issued generation
+        epochs, and the version contracts of the outgoing block.  Any
+        mismatch indicates cross-stage desync or a stale packet from an
+        earlier lifecycle, and must abort rather than silently apply results.
+        """
+        if not self.is_dvi_block:
+            return
+        num_reqs = len(self.req_ids)
+        if len(self.sampled_token_ids) != num_reqs:
+            raise ValueError(
+                f"DVI token packet has {len(self.sampled_token_ids)} sampled "
+                f"entries for {num_reqs} requests"
+            )
+        if self.num_sampled is None or self.num_rejected is None:
+            raise ValueError("DVI token packet missing num_sampled/num_rejected")
+        if len(self.num_sampled) != num_reqs or len(self.num_rejected) != num_reqs:
+            raise ValueError(
+                "DVI token packet num_sampled/num_rejected length mismatch"
+            )
+        if len(set(self.req_ids)) != num_reqs:
+            raise ValueError("DVI token packet contains duplicate req_ids")
+        for i, ids in enumerate(self.sampled_token_ids):
+            if len(ids) < self.num_sampled[i]:
+                raise ValueError(
+                    f"DVI token packet req {i}: num_sampled="
+                    f"{self.num_sampled[i]} exceeds padded token list "
+                    f"(len={len(ids)})"
+                )
+            if self.num_sampled[i] < 0:
+                raise ValueError(
+                    f"DVI token packet req {i}: negative num_sampled"
+                )
+            if self.num_rejected[i] < 0:
+                raise ValueError(
+                    f"DVI token packet req {i}: negative num_rejected"
+                )
+        if self.cycle_ids is None:
+            raise ValueError("DVI token packet missing cycle_ids")
+        if len(self.cycle_ids) != num_reqs:
+            raise ValueError("DVI token packet cycle_ids length mismatch")
+        if (
+            expected_cycle_ids is not None
+            and self.cycle_ids != expected_cycle_ids
+        ):
+            raise ValueError(
+                f"DVI token packet cycle mismatch: expected "
+                f"{expected_cycle_ids}, got {self.cycle_ids}"
+            )
+        if self.generation_ids is None:
+            raise ValueError("DVI token packet missing generation_ids")
+        if len(self.generation_ids) != num_reqs:
+            raise ValueError("DVI token packet generation_ids length mismatch")
+        if (
+            expected_generation_ids is not None
+            and self.generation_ids != expected_generation_ids
+        ):
+            raise ValueError(
+                f"DVI token packet generation mismatch: expected "
+                f"{expected_generation_ids}, got {self.generation_ids}"
+            )
+        if (
+            expected_policy_version is not None
+            and self.policy_version != expected_policy_version
+        ):
+            raise ValueError(
+                f"DVI token packet policy_version mismatch: expected "
+                f"{expected_policy_version!r}, got {self.policy_version!r}"
+            )
+        if (
+            expected_draft_version is not None
+            and self.draft_version != expected_draft_version
+        ):
+            raise ValueError(
+                f"DVI token packet draft_version mismatch: expected "
+                f"{expected_draft_version!r}, got {self.draft_version!r}"
             )
 
     def to_tensors(

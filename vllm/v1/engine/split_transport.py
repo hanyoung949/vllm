@@ -104,10 +104,16 @@ class ZmqSplitActivationTransport(SplitActivationTransport):
         self._poll_timeout_ms = poll_timeout_ms
         self._context = zmq.Context()
         self._closed = False
+        self._lock = threading.Lock()
 
-        # Tensor sockets.
+        # Initialize every socket attribute up front so that close() stays
+        # safe when __init__ aborts midway (e.g. a bind failure).
         self._tensor_recv: zmq.Socket | None = None
         self._tensor_send: zmq.Socket | None = None
+        self._token_recv: zmq.Socket | None = None
+        self._token_sends: list[zmq.Socket] = []
+
+        # Tensor sockets.
         if endpoints.tensor_recv_addr:
             self._tensor_recv = self._context.socket(zmq.PULL)
             self._tensor_recv.bind(endpoints.tensor_recv_addr)
@@ -116,8 +122,6 @@ class ZmqSplitActivationTransport(SplitActivationTransport):
             self._tensor_send.connect(endpoints.tensor_send_addr)
 
         # Token sockets.
-        self._token_recv: zmq.Socket | None = None
-        self._token_sends: list[zmq.Socket] = []
         if endpoints.token_recv_addr:
             self._token_recv = self._context.socket(zmq.PULL)
             self._token_recv.bind(endpoints.token_recv_addr)
@@ -125,8 +129,6 @@ class ZmqSplitActivationTransport(SplitActivationTransport):
             sock = self._context.socket(zmq.PUSH)
             sock.connect(addr)
             self._token_sends.append(sock)
-
-        self._lock = threading.Lock()
 
     def send_tensor_packet(self, packet: SplitTensorPacket) -> None:
         if self._tensor_send is None:

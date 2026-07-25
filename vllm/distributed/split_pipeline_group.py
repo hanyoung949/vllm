@@ -307,6 +307,7 @@ class SplitPipelineGroup:
                 f"(rank {expected_dst}), got dst={dst}."
             )
         metadata = self._tensor_metadata
+        dvi_metadata = metadata.get("dvi") if metadata else None
         packet = SplitTensorPacket(
             req_ids=metadata.get("req_ids", []) if metadata else [],
             num_scheduled_tokens=metadata.get("num_scheduled_tokens", [])
@@ -314,6 +315,28 @@ class SplitPipelineGroup:
             else [],
             is_prompt=metadata.get("is_prompt", False) if metadata else False,
             tensors=tensor_dict,
+            packet_kind=dvi_metadata.get("packet_kind", "normal")
+            if dvi_metadata
+            else "normal",
+            cycle_ids=dvi_metadata.get("cycle_ids") if dvi_metadata else None,
+            draft_token_ids=dvi_metadata.get("draft_token_ids")
+            if dvi_metadata
+            else None,
+            draft_lengths=dvi_metadata.get("draft_lengths")
+            if dvi_metadata
+            else None,
+            generation_ids=dvi_metadata.get("generation_ids")
+            if dvi_metadata
+            else None,
+            draft_positions=dvi_metadata.get("draft_positions")
+            if dvi_metadata
+            else None,
+            policy_version=dvi_metadata.get("policy_version")
+            if dvi_metadata
+            else None,
+            draft_version=dvi_metadata.get("draft_version")
+            if dvi_metadata
+            else None,
         )
         self._tensor_metadata = None
         assert self._transport is not None
@@ -384,6 +407,18 @@ class SplitPipelineGroup:
             "req_ids": packet.req_ids,
             "num_scheduled_tokens": packet.num_scheduled_tokens,
             "is_prompt": packet.is_prompt,
+            "dvi": {
+                "packet_kind": packet.packet_kind,
+                "cycle_ids": packet.cycle_ids,
+                "draft_token_ids": packet.draft_token_ids,
+                "draft_lengths": packet.draft_lengths,
+                "generation_ids": packet.generation_ids,
+                "draft_positions": packet.draft_positions,
+                "policy_version": packet.policy_version,
+                "draft_version": packet.draft_version,
+            }
+            if packet.is_dvi_block
+            else None,
         }
         tensors = self._broadcast_tensor_dict_within_stage(packet.tensors)
         return tensors, [], []
@@ -511,12 +546,19 @@ class SplitPipelineGroup:
         req_ids: list[str],
         num_scheduled_tokens: list[int],
         is_prompt: bool,
+        dvi_metadata: dict[str, Any] | None = None,
     ) -> None:
-        """Store metadata to be included in the next sent tensor packet."""
+        """Store metadata to be included in the next sent tensor packet.
+
+        ``dvi_metadata`` carries the Stage-DVI block fields (packet_kind,
+        cycle_ids, draft_token_ids, draft_lengths) when the outgoing packet
+        is a DVI block; it is None for normal packets.
+        """
         self._tensor_metadata = {
             "req_ids": req_ids,
             "num_scheduled_tokens": num_scheduled_tokens,
             "is_prompt": is_prompt,
+            "dvi": dvi_metadata,
         }
 
     def get_tensor_metadata(self) -> dict[str, Any] | None:

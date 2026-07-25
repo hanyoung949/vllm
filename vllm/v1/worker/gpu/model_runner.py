@@ -100,6 +100,8 @@ from vllm.v1.worker.gpu.pool.pooling_runner import PoolingRunner
 from vllm.v1.worker.gpu.pp_utils import PPHandler
 from vllm.v1.worker.gpu.split_pp_handler import SplitPPHandler
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
+from vllm.v1.worker.gpu.split_dvi.hooks import DVIStage2TelemetryHook
+from vllm.v1.worker.gpu.split_dvi.runtime import DVIStepKind
 from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.shutdown import free_before_shutdown
@@ -238,6 +240,32 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     device=self.device,
                 )
 
+        # Set by warmup_kernels while synthetic warmup batches flow through
+        # the real execute path, so subsystems (e.g. Stage-DVI metrics) can
+        # ignore those batches.
+        self.in_warmup: bool = False
+
+        # Stage-DVI runtime (layer-wise split distributed draft/verify).
+        # Created before load_model so the draft head is accounted in the
+        # model memory profile.  No-op unless split_dvi_config.enabled.
+        self.split_dvi_runtime = None
+        if (
+            vllm_config.split_dvi_config is not None
+            and vllm_config.split_dvi_config.enabled
+        ):
+            from vllm.v1.worker.gpu.split_dvi.runtime import SplitDVIRuntime
+
+            self.split_dvi_runtime = SplitDVIRuntime(
+                self, vllm_config.split_dvi_config
+            )
+            if isinstance(self.pp_handler, SplitPPHandler):
+                self.pp_handler.dvi_token_validator = (
+                    self.split_dvi_runtime.validate_token_packet
+                )
+                self.pp_handler.dvi_result_notifier = (
+                    self.split_dvi_runtime.note_dvi_result_received
+                )
+
         # Samplers and decode_query_len created in load_model() after
         # model_state exists (num_new_sampled_tokens_per_step from ModelState).
         self.sampler: Sampler | None = None
@@ -262,6 +290,33 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # Expert parallelism load balancer.
         self.eplb = EPLBController(self.parallel_config, self.device)
+
+        # DVI L0 telemetry hook (set externally by split-RL driver/worker).
+        self.dvi_telemetry_hook: DVIStage2TelemetryHook | None = None
+        self.dvi_top_k = 8  # default; updated when hook is injected
+
+    def set_dvi_telemetry_hook(
+        self,
+        hook: DVIStage2TelemetryHook | None,
+    ) -> None:
+        """Inject (or remove) the DVI L0 telemetry hook.
+
+        Updates the sampler's top-k configuration to match the hook's session
+        metadata so that the produced side output is compatible with the spool.
+        """
+        self.dvi_telemetry_hook = hook
+        if hook is not None:
+            self.dvi_top_k = hook.dvi_top_k
+            if self.sampler is not None and getattr(
+                self.sampler, "supports_dvi_telemetry", False
+            ):
+                self.sampler.dvi_telemetry_enabled = True
+                self.sampler.dvi_top_k = hook.dvi_top_k
+        else:
+            if self.sampler is not None and getattr(
+                self.sampler, "supports_dvi_telemetry", False
+            ):
+                self.sampler.dvi_telemetry_enabled = False
 
     def update_max_model_len(self, max_model_len: int) -> None:
         self.max_model_len = max_model_len
@@ -304,6 +359,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 eplb_models_added = self.eplb.maybe_register_speculator(
                     self.speculator, self.speculative_config, load_dummy_weights
                 )
+            if self.split_dvi_runtime is not None:
+                # Load the stage_0 draft head inside the memory profiler so it
+                # is accounted in the KV-cache sizing budget.
+                self.split_dvi_runtime.on_model_loaded()
         time_after_load = time.perf_counter()
 
         self.model_memory_usage = m.consumed_memory
@@ -338,6 +397,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 logprobs_mode=self.model_config.logprobs_mode,
                 num_speculative_tokens=self.decode_query_len,
                 use_fp64_gumbel=self.model_config.use_fp64_gumbel,
+                dvi_telemetry_enabled=False,
+                dvi_top_k=self.dvi_top_k,
             )
             custom = self.model_state.custom_sampler(self.sampler)
 
@@ -750,6 +811,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return False
         if self.pp_handler is not None:
             self.pp_handler.on_req_idx_freed(req_idx)
+        if self.split_dvi_runtime is not None:
+            self.split_dvi_runtime.on_request_removed(req_id)
         if self.encoder_cache is not None:
             self.encoder_cache.remove_request(req_id)
         if self.prompt_logprobs_worker is not None:
@@ -808,6 +871,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 req_index, new_req_data.block_ids, overwrite=True
             )
             self.lora_state.add_request(req_id, req_index, new_req_data.lora_request)
+
+            if self.split_dvi_runtime is not None:
+                # Registers protocol state and (fail-fast) rejects non-greedy
+                # sampling on every stage consistently.  The generation epoch
+                # is scheduler-issued (single source of truth).
+                self.split_dvi_runtime.on_request_added(
+                    req_id, sampling_params, new_req_data.generation_id
+                )
 
             if self.is_last_pp_rank and new_req_data.sampling_params is not None:
                 assert self.sampler is not None
@@ -1086,9 +1157,35 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 grammar_output.grammar_bitmask,
             )
 
+        if self.dvi_telemetry_hook is None:
+            dvi_reserved_row_indices = None
+            dvi_tickets = None
+        else:
+            dvi_reserved_row_indices, dvi_tickets = self._reserve_dvi_telemetry_rows(
+                input_batch
+            )
+
         if input_batch.num_draft_tokens == 0 or self.rejection_sampler is None:
             assert self.sampler is not None
-            sampler_output = self.sampler(logits, input_batch)
+            # Only pass the DVI argument when there are reserved rows and the
+            # sampler declares support, so custom samplers without the kwarg do
+            # not break when telemetry is disabled.
+            if dvi_reserved_row_indices is not None and getattr(
+                self.sampler, "supports_dvi_telemetry", False
+            ):
+                sampler_output = self.sampler(
+                    logits,
+                    input_batch,
+                    dvi_reserved_row_indices=dvi_reserved_row_indices,
+                )
+            else:
+                if dvi_reserved_row_indices is not None:
+                    # Reserved rows exist but sampler cannot provide processed
+                    # distribution; cancel them and fall back to normal path.
+                    for ticket in dvi_tickets:
+                        if ticket is not None:
+                            self.dvi_telemetry_hook.cancel(ticket)
+                sampler_output = self.sampler(logits, input_batch)
         else:
             # Rejection sampling for spec decoding.
             assert self.rejection_sampler is not None
@@ -1100,7 +1197,130 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 self.speculator.draft_logits,
             )
 
+        if dvi_tickets is not None:
+            self._submit_dvi_telemetry(sampler_output, dvi_tickets)
+
         return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected
+
+    def _reserve_dvi_telemetry_rows(
+        self,
+        input_batch: InputBatch,
+    ) -> tuple[torch.Tensor | None, list[Any]]:
+        """Reserve DVI L0 telemetry tickets for sampled logit rows.
+
+        Returns a tensor of reserved row indices into the logits tensor and a
+        parallel list of opaque tickets (None for non-reserved rows). The
+        tensor is passed to the sampler so it only computes the processed top-k
+        distribution for reserved rows.
+
+        This path uses CPU metadata only (no GPU->Python int per row) and only
+        handles the non-speculative-decode case, where each request contributes
+        exactly one logit row and row index equals batch index.
+        """
+        hook = self.dvi_telemetry_hook
+        if hook is None or not hook.enabled:
+            return None, []
+        # L0 telemetry does not support speculative decoding in this milestone.
+        if input_batch.num_draft_tokens > 0:
+            return None, []
+        if not self.is_last_pp_rank or self.is_pooling_model:
+            return None, []
+
+        num_reqs = input_batch.num_reqs
+        if num_reqs == 0:
+            return None, []
+
+        req_ids = input_batch.req_ids
+        num_computed_tokens_np = input_batch.num_computed_tokens_np
+        num_scheduled_tokens = input_batch.num_scheduled_tokens
+        prefill_len_np = input_batch.prefill_len_np
+
+        reserved_rows: list[int] = []
+        tickets: list[Any] = [None] * num_reqs
+        for batch_idx in range(num_reqs):
+            response_pos = (
+                int(num_computed_tokens_np[batch_idx])
+                + int(num_scheduled_tokens[batch_idx])
+                - int(prefill_len_np[batch_idx])
+            )
+            if response_pos < 0:
+                # Chunked prefill that has not reached the first decode token.
+                continue
+            key = hook.make_record_key(req_ids[batch_idx], response_pos)
+            ticket = hook.reserve(key)
+            tickets[batch_idx] = ticket
+            if ticket is not None:
+                reserved_rows.append(batch_idx)
+
+        if not reserved_rows:
+            return None, tickets
+
+        reserved_row_indices = torch.tensor(
+            reserved_rows,
+            dtype=torch.int64,
+            device=self.device,
+        )
+        return reserved_row_indices, tickets
+
+    def _submit_dvi_telemetry(
+        self,
+        sampler_output: SamplerOutput,
+        dvi_tickets: list[Any] | None,
+    ) -> None:
+        """Submit (or cancel) reserved DVI telemetry tickets."""
+        if dvi_tickets is None:
+            return
+        hook = self.dvi_telemetry_hook
+        if hook is None or not hook.enabled:
+            return
+
+        dvi_tensors = sampler_output.dvi_telemetry_tensors
+        if dvi_tensors is None:
+            for ticket in dvi_tickets:
+                if ticket is not None:
+                    hook.cancel(ticket)
+            return
+
+        topk_ids_cpu = dvi_tensors.topk_ids.cpu()
+        topk_logprobs_cpu = dvi_tensors.topk_logprobs.cpu()
+        residual_mass_cpu = dvi_tensors.residual_mass.cpu()
+        top1_id_cpu = dvi_tensors.top1_id.cpu()
+        valid_count_cpu = dvi_tensors.valid_count.cpu()
+
+        reserved_idx = 0
+        num_reserved = len(topk_ids_cpu)
+        for ticket in dvi_tickets:
+            if ticket is None:
+                continue
+            if reserved_idx >= num_reserved:
+                hook.cancel(ticket)
+                continue
+            valid_count = int(valid_count_cpu[reserved_idx])
+            if valid_count == 0:
+                hook.cancel(ticket)
+                reserved_idx += 1
+                continue
+            verifier_topk_ids = topk_ids_cpu[reserved_idx, :valid_count].tolist()
+            verifier_topk_logprobs = topk_logprobs_cpu[
+                reserved_idx, :valid_count
+            ].tolist()
+            verifier_top1_id = int(top1_id_cpu[reserved_idx])
+            if verifier_top1_id not in verifier_topk_ids:
+                # Top-1 must be in the finite prefix; otherwise the record is
+                # invalid for the artifact schema.
+                hook.cancel(ticket)
+                reserved_idx += 1
+                continue
+            ok = hook.submit_processed_topk(
+                ticket,
+                verifier_topk_ids=verifier_topk_ids,
+                verifier_topk_logprobs=verifier_topk_logprobs,
+                verifier_residual_mass=float(residual_mass_cpu[reserved_idx]),
+                verifier_top1_id=verifier_top1_id,
+            )
+            if not ok:
+                hook.cancel(ticket)
+            reserved_idx += 1
 
     def postprocess_sampled(
         self,
@@ -1191,11 +1411,20 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             empty_output = self.kv_connector.no_forward(scheduler_output)
             return empty_output
 
+        dvi_step_kind = None
         if not dummy_run:
             # Common case.
             # Prepare all the inputs and copy to the input buffers.
             input_batch = self.prepare_inputs(scheduler_output, batch_desc)
             block_tables, slot_mappings = self.prepare_attn(input_batch)
+
+            # Stage-DVI: classify the step and advance protocol cycles.  On
+            # non-first stages also validate the incoming packet's metadata.
+            if self.split_dvi_runtime is not None:
+                dvi_step_kind = self.split_dvi_runtime.plan_step(input_batch)
+                if not self.is_first_pp_rank:
+                    self.split_dvi_runtime.capture_incoming_metadata(input_batch)
+
             # Mamba "align" pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and
             # before model_state.prepare_attn gathers num_accepted_tokens so the
@@ -1307,7 +1536,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.eplb.prepare_forward(self.model_config, input_batch.num_tokens)
 
         # Run model.
-        if batch_desc.cg_mode == CUDAGraphMode.FULL:
+        if dvi_step_kind is DVIStepKind.DRAFT:
+            # Stage-DVI draft step on stage_0: replace the expanded forward
+            # with the boundary + draft loop; the block's intermediate tensors
+            # align row-for-row with the expanded batch downstream stages run.
+            assert self.is_first_pp_rank
+            model_output = self.split_dvi_runtime.generate_draft_block(input_batch)
+        elif batch_desc.cg_mode == CUDAGraphMode.FULL:
             # Use explicit cudagraph replay for FULL mode.
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
             # because they are already copied to the CUDA graph input buffers.
@@ -1345,6 +1580,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 else:
                     # Eager (NONE): call the raw model directly.
                     model_output = self.model(**model_inputs)
+
+        if (
+            dvi_step_kind is DVIStepKind.FALLBACK
+            and self.is_first_pp_rank
+            and self.split_dvi_runtime is not None
+        ):
+            # Normal expanded forward just ran on stage_0; attach dummy draft
+            # metadata so downstream stages stay on the DVI protocol.
+            self.split_dvi_runtime.make_fallback_metadata(input_batch)
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:
@@ -1412,9 +1656,29 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             return ModelRunnerOutput.with_kv_conn_output_only(kv_connector_output)
 
         # Last rank: sample tokens
-        sampler_output, num_sampled, num_rejected = self.sample(
-            hidden_states, input_batch, grammar_output
-        )
+        dvi_extras: dict | None = None
+        if (
+            self.split_dvi_runtime is not None
+            and self.split_dvi_runtime.incoming_is_dvi_block
+        ):
+            # Stage-DVI: greedy block verification replaces the sampler.
+            dvi_result = self.split_dvi_runtime.verify_block(
+                hidden_states, input_batch
+            )
+            sampler_output = dvi_result.sampler_output
+            num_sampled = dvi_result.num_sampled
+            num_rejected = dvi_result.num_rejected
+            dvi_extras = {
+                "cycle_ids": dvi_result.cycle_ids,
+                "accepted_counts": dvi_result.accepted_counts,
+                "generation_ids": dvi_result.generation_ids,
+                "policy_version": dvi_result.policy_version,
+                "draft_version": dvi_result.draft_version,
+            }
+        else:
+            sampler_output, num_sampled, num_rejected = self.sample(
+                hidden_states, input_batch, grammar_output
+            )
 
         if self.pp_handler is not None:
             # Broadcast to non-last PP ranks (handles spec decode multi-token).
@@ -1423,6 +1687,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 num_sampled,
                 num_rejected,
                 input_batch,
+                dvi_extras=dvi_extras,
             )
 
         assert self.prompt_logprobs_worker is not None
@@ -1571,6 +1836,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def shutdown(self) -> None:
         """Release GPU tensors (model weights, KV caches, workspace) so that
         memory is reclaimable when running in the same process."""
+        # Final Stage-DVI metrics dump: short runs may never reach the
+        # periodic flush interval, so emit the counters at teardown.
+        if self.split_dvi_runtime is not None:
+            self.split_dvi_runtime.flush_metrics()
         torch.accelerator.synchronize()
         if hasattr(self, "kv_caches"):
             self.kv_caches.clear()

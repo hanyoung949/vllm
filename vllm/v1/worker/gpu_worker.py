@@ -1108,12 +1108,33 @@ class Worker(WorkerBase):
 
         # launch non-blocking send of intermediate tensors
         if scheduler_output.total_num_scheduled_tokens > 0:
+            dvi_metadata = None
+            split_dvi_runtime = getattr(
+                self.model_runner, "split_dvi_runtime", None
+            )
+            if split_dvi_runtime is not None:
+                # Stage-DVI: block metadata produced by stage_0 (draft or
+                # fallback) or passed through by stage_1.
+                dvi_metadata = split_dvi_runtime.outgoing_metadata()
+            # The packet metadata must follow the runner's actual batch row
+            # order (sort_batch_req_ids), which may differ from the scheduler
+            # dict order on mixed prefill/decode steps; the tensors were
+            # produced in that same order.
+            batch_req_ids = list(scheduler_output.num_scheduled_tokens.keys())
+            batch_num_scheduled = list(scheduler_output.num_scheduled_tokens.values())
+            execute_model_state = getattr(
+                self.model_runner, "execute_model_state", None
+            )
+            if execute_model_state is not None:
+                batch_req_ids = list(execute_model_state.input_batch.req_ids)
+                batch_num_scheduled = (
+                    execute_model_state.input_batch.num_scheduled_tokens.tolist()
+                )
             get_pp_group().set_tensor_metadata(
-                req_ids=list(scheduler_output.num_scheduled_tokens.keys()),
-                num_scheduled_tokens=list(
-                    scheduler_output.num_scheduled_tokens.values()
-                ),
+                req_ids=batch_req_ids,
+                num_scheduled_tokens=batch_num_scheduled,
                 is_prompt=len(scheduler_output.scheduled_new_reqs) > 0,
+                dvi_metadata=dvi_metadata,
             )
         self._pp_send_work = get_pp_group().isend_tensor_dict(
             output.tensors,

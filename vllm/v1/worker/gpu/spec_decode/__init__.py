@@ -8,6 +8,12 @@ from vllm.config import VllmConfig
 def init_speculator(vllm_config: VllmConfig, device: torch.device):
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
+    if speculative_config.method == "split_dvi":
+        # Stage-DVI carries no speculator: the draft head lives on split
+        # stage_0 (not on the last PP rank) and draft blocks travel inside
+        # split packets.  Returning None keeps every `self.speculator`
+        # consumer on its no-speculator path.
+        return None
     if speculative_config.method == "dflash":
         from vllm.v1.worker.gpu.spec_decode.dflash.speculator import (
             DFlashSpeculator,

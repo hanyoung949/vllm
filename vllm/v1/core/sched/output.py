@@ -45,6 +45,11 @@ class NewRequestData:
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
 
+    # Scheduler-issued lifecycle epoch (== Request.num_preemptions at add
+    # time).  Single source of truth broadcast identically to every worker;
+    # used by Stage-DVI to reject stale packets from earlier lifecycles.
+    generation_id: int = 0
+
     @classmethod
     def from_request(
         cls,
@@ -64,6 +69,7 @@ class NewRequestData:
             prompt_embeds=request.prompt_embeds,
             prompt_is_token_ids=request.prompt_is_token_ids,
             prefill_token_ids=prefill_token_ids,
+            generation_id=request.num_preemptions,
         )
 
     def __repr__(self) -> str:

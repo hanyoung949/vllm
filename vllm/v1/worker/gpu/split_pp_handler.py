@@ -53,6 +53,11 @@ class SplitPPHandler(PPHandler):
         self._split_pp = pp
         self._tp_group = get_tp_group()
         self._is_stage_1 = self.rank == 1
+        # Optional Stage-DVI hooks wired by the model runner when split_dvi is
+        # enabled: the validator runs on representative ranks (fail-fast on
+        # desync), the notifier runs on every non-last rank to mark results.
+        self.dvi_token_validator = None
+        self.dvi_result_notifier = None
 
     def on_req_idx_freed(self, req_idx: int) -> None:
         self.req_idx_gen_np[req_idx] += 1
@@ -78,6 +83,11 @@ class SplitPPHandler(PPHandler):
                 # stage_0/stage_1 representative: receive over TCP from stage_2.
                 packet = self._split_pp._token_transport.recv_token_packet()
                 packet.validate_req_ids(input_batch.req_ids)
+                if packet.is_dvi_block and self.dvi_token_validator is not None:
+                    # Stage-DVI: cycle/structure validation; raises on desync.
+                    # input_batch lets the validator scope the awaiting check
+                    # to requests that were actually spec-booked this step.
+                    self.dvi_token_validator(packet, input_batch)
                 recv_sampled, recv_num_sampled, recv_num_rejected = (
                     packet.to_tensors(
                         device=self.device,
@@ -94,6 +104,30 @@ class SplitPPHandler(PPHandler):
             if self._is_stage_1:
                 self._tp_group.broadcast(sampled_tokens, src=0)
                 self._tp_group.broadcast(combined, src=0)
+
+            # Mark results on non-last ranks for DVI-block steps, scoped to
+            # the requests that were actually spec-booked (same per-request
+            # rule as the packet validator): 0-draft rows in a mixed/fallback
+            # block carry ordinary samples, and blindly marking them could
+            # clear an awaiting flag that is none of this packet's business.
+            # The step's packet kind equals "the step booked draft tokens" by
+            # construction, and every rank shares the scheduler output, so
+            # derive it locally — non-representative stage_1 TP ranks never
+            # see the TCP packet.
+            if input_batch.num_draft_tokens > 0 and (
+                self.dvi_result_notifier is not None
+            ):
+                num_draft = input_batch.num_draft_tokens_per_req
+                nd = (
+                    num_draft.tolist()
+                    if hasattr(num_draft, "tolist")
+                    else (list(num_draft) if num_draft is not None else [])
+                )
+                spec_req_ids = [
+                    r for r, n in zip(input_batch.req_ids, nd) if n > 0
+                ]
+                if spec_req_ids:
+                    self.dvi_result_notifier(spec_req_ids)
 
             event = self.broadcast_stream.record_event()
             num_sampled, num_rejected = combined.unbind(dim=0)
@@ -118,8 +152,14 @@ class SplitPPHandler(PPHandler):
         num_sampled: torch.Tensor,
         num_rejected: torch.Tensor,
         input_batch: InputBatch,
+        dvi_extras: dict | None = None,
     ) -> None:
-        """Send sampled tokens from stage_2 to stage_0/stage_1 via TCP."""
+        """Send sampled tokens from stage_2 to stage_0/stage_1 via TCP.
+
+        ``dvi_extras`` carries the DVI echo fields (cycle_ids,
+        accepted_counts, generation_ids, policy_version, draft_version) when
+        the packet answers a Stage-DVI block.
+        """
         assert self.is_last_rank
         if compute_need_sampled_mask(input_batch) is None:
             return
@@ -135,12 +175,26 @@ class SplitPPHandler(PPHandler):
         with torch.cuda.stream(self.broadcast_stream):
             self.broadcast_stream.wait_stream(self.main_stream)
             if self._split_pp._is_representative:
-                packet = SplitTokenPacket.from_tensors(
-                    req_ids=input_batch.req_ids,
-                    sampled_token_ids=sampled_token_ids,
-                    num_sampled=num_sampled,
-                    num_rejected=num_rejected,
-                )
+                if dvi_extras is not None:
+                    packet = SplitTokenPacket.from_tensors(
+                        req_ids=input_batch.req_ids,
+                        sampled_token_ids=sampled_token_ids,
+                        num_sampled=num_sampled,
+                        num_rejected=num_rejected,
+                        packet_kind="dvi_block",
+                        cycle_ids=dvi_extras["cycle_ids"],
+                        accepted_counts=dvi_extras["accepted_counts"],
+                        generation_ids=dvi_extras["generation_ids"],
+                        policy_version=dvi_extras.get("policy_version"),
+                        draft_version=dvi_extras.get("draft_version"),
+                    )
+                else:
+                    packet = SplitTokenPacket.from_tensors(
+                        req_ids=input_batch.req_ids,
+                        sampled_token_ids=sampled_token_ids,
+                        num_sampled=num_sampled,
+                        num_rejected=num_rejected,
+                    )
                 self._split_pp._token_transport.send_token_packet(packet)
             for tensor in (sampled_token_ids, num_sampled, num_rejected):
                 tensor.record_stream(self.broadcast_stream)

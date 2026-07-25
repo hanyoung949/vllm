@@ -167,6 +167,9 @@ def warmup_kernels(
     """
     num_spec_steps = model_runner.num_speculative_steps
     decode_query_len = model_runner.decode_query_len
+    # Mark the synthetic batches below so downstream observers (e.g.
+    # Stage-DVI metrics) can ignore them; cleared at the end of warmup.
+    model_runner.in_warmup = True
     # Use decode_query_len + 1 tokens so the prefill batch's per-request query
     # length exceeds decode_query_len, preventing it from being misclassified as
     # a uniform decode batch.
@@ -315,4 +318,5 @@ def warmup_kernels(
     cleanup_output.finished_req_ids = set(req_ids)
     worker_execute_model(cleanup_output)
     model_runner.kv_connector.set_disabled(False)
+    model_runner.in_warmup = False
     torch.accelerator.synchronize()

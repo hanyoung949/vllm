@@ -21,7 +21,7 @@ from vllm.v1.worker.gpu.sample.logprob import (
     LogprobTokenIdsState,
     compute_topk_logprobs,
 )
-from vllm.v1.worker.gpu.sample.output import SamplerOutput
+from vllm.v1.worker.gpu.sample.output import SamplerOutput, DVITelemetrySideOutput
 from vllm.v1.worker.gpu.sample.penalties import PenaltiesState
 from vllm.v1.worker.gpu.sample.states import NO_LOGPROBS, SamplingStates
 from vllm.v1.worker.gpu.states import RequestState
@@ -37,6 +37,8 @@ class Sampler:
         logprobs_mode: LogprobsMode = "raw_logprobs",
         num_speculative_tokens: int = 1,
         use_fp64_gumbel: bool = False,
+        dvi_telemetry_enabled: bool = False,
+        dvi_top_k: int = 8,
     ):
         if logprobs_mode not in ("processed_logprobs", "raw_logprobs"):
             raise NotImplementedError(f"Unsupported logprobs_mode: {logprobs_mode}")
@@ -52,6 +54,14 @@ class Sampler:
         self.logprob_token_ids_state = LogprobTokenIdsState(max_num_reqs, device)
         self.num_speculative_tokens = num_speculative_tokens
         self.use_flashinfer = flashinfer_sampler_supported()
+
+        # DVI L0 telemetry support: built-in sampler can return processed
+        # distribution side output. Custom samplers must opt-in by setting this
+        # attribute to True.
+        self.supports_dvi_telemetry = True
+
+        self.dvi_telemetry_enabled = dvi_telemetry_enabled
+        self.dvi_top_k = dvi_top_k
 
     def add_request(
         self, req_idx: int, prompt_len: int, sampling_params: SamplingParams
@@ -73,6 +83,7 @@ class Sampler:
         self,
         logits: torch.Tensor,
         input_batch: InputBatch,
+        dvi_reserved_row_indices: torch.Tensor | None = None,
     ) -> SamplerOutput:
         expanded_idx_mapping = input_batch.expanded_idx_mapping
         idx_mapping_np = input_batch.idx_mapping_np
@@ -91,7 +102,7 @@ class Sampler:
         )
         return_logprobs = max_num_logprobs != NO_LOGPROBS or max_per_req_token_ids > 0
 
-        sampled, processed_logits = self.sample(
+        sampled, processed_logits, dvi_telemetry_tensors = self.sample(
             logits,
             expanded_idx_mapping,
             idx_mapping_np,
@@ -99,6 +110,7 @@ class Sampler:
             input_ids,
             expanded_local_pos,
             return_logprobs=return_logprobs,
+            dvi_reserved_row_indices=dvi_reserved_row_indices,
         )
 
         if return_logprobs:
@@ -140,6 +152,7 @@ class Sampler:
             num_nans=num_nans,
             num_sampled=num_sampled,
             num_rejected=num_rejected,
+            dvi_telemetry_tensors=dvi_telemetry_tensors,
         )
         return sampler_output
 
@@ -204,7 +217,8 @@ class Sampler:
         input_ids: torch.Tensor,
         expanded_local_pos: torch.Tensor,
         return_logprobs: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+        dvi_reserved_row_indices: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, DVITelemetrySideOutput | None]:
         processed_logits = self.apply_sampling_params(
             logits,
             expanded_idx_mapping,
@@ -217,14 +231,25 @@ class Sampler:
         top_k, top_p = self.sampling_states.get_top_k_top_p(
             expanded_idx_mapping, idx_mapping_np
         )
+
+        # DVI telemetry requires the processed distribution (post-top-k/top-p),
+        # which FlashInfer cannot return. Force native path when telemetry rows
+        # are reserved.
+        dvi_active = (
+            self.dvi_telemetry_enabled
+            and dvi_reserved_row_indices is not None
+            and dvi_reserved_row_indices.numel() > 0
+        )
         use_flashinfer = self.use_flashinfer and not (
             # Don't use FI sampler if no requests use top_k/top_p, if there are
-            # any greedy requests or per-request seeds, or if post-processed
-            # logprobs need to be returned for any requests.
+            # any greedy requests or per-request seeds, if post-processed
+            # logprobs need to be returned for any requests, or if DVI telemetry
+            # needs the processed distribution.
             (top_k is None and top_p is None)
             or (return_logprobs and self.logprobs_mode == "processed_logprobs")
             or self.sampling_states.any_greedy(idx_mapping_np)
             or self.sampling_states.any_explicit_seed(idx_mapping_np)
+            or dvi_active
         )
 
         # Sample the next token.
@@ -241,4 +266,38 @@ class Sampler:
                 apply_temperature=False,
                 use_fp64=self.use_fp64_gumbel,
             )
-        return sampled, processed_logits
+
+        dvi_telemetry_tensors = None
+        if dvi_active:
+            dvi_telemetry_tensors = self._compute_dvi_telemetry_side_output(
+                processed_logits, dvi_reserved_row_indices
+            )
+
+        return sampled, processed_logits, dvi_telemetry_tensors
+
+    def _compute_dvi_telemetry_side_output(
+        self,
+        processed_logits: torch.Tensor,
+        reserved_row_indices: torch.Tensor,
+    ) -> DVITelemetrySideOutput:
+        """Compute compact processed top-k distribution for reserved rows."""
+        reserved_logits = processed_logits[reserved_row_indices]
+        topk_vals, topk_ids = torch.topk(
+            reserved_logits, k=min(self.dvi_top_k, reserved_logits.size(-1)), dim=-1
+        )
+        log_probs = torch.log_softmax(reserved_logits, dim=-1)
+        topk_logprobs = log_probs.gather(-1, topk_ids)
+        # top-k sampling masks can produce -inf logprobs for masked tokens.
+        # Only the finite prefix is valid for the artifact.
+        valid_mask = torch.isfinite(topk_logprobs)
+        valid_count = valid_mask.sum(dim=-1, dtype=torch.int32)
+        residual_mass = 1.0 - topk_logprobs.exp().sum(dim=-1)
+        residual_mass = residual_mass.clamp(0.0, 1.0)
+        top1_id = reserved_logits.argmax(dim=-1)
+        return DVITelemetrySideOutput(
+            topk_ids=topk_ids.to(torch.int32),
+            topk_logprobs=topk_logprobs,
+            residual_mass=residual_mass,
+            top1_id=top1_id.to(torch.int32),
+            valid_count=valid_count,
+        )
