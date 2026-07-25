@@ -7,6 +7,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from vllm.v1.engine.split_data import SplitDVIProtocolError
 from vllm.v1.worker.gpu.split_dvi.block_verifier import (
     SplitDVIGreedyBlockVerifier,
 )
@@ -159,13 +160,13 @@ def test_to_padded_tensors_shape_and_values():
 
 def test_mismatched_metadata_fails_fast():
     logits = _logits_for_targets([1, 2, 3, 4])
-    with pytest.raises(ValueError, match="cu_num_logits"):
+    with pytest.raises(SplitDVIProtocolError, match="cu_num_logits"):
         V.verify(logits, ["r0"], [1, 2, 3, 4], [4], [0, 4, 8])
-    with pytest.raises(ValueError, match="draft_lengths"):
+    with pytest.raises(SplitDVIProtocolError, match="draft_lengths"):
         V.verify(logits, ["r0"], [1, 2, 3, 4], [4, 4], [0, 4])
-    with pytest.raises(ValueError, match="draft_token_ids"):
+    with pytest.raises(SplitDVIProtocolError, match="draft_token_ids"):
         V.verify(logits, ["r0"], [1, 2, 3], [4], [0, 4])
-    with pytest.raises(ValueError, match="draft_length 5 > num_logits"):
+    with pytest.raises(SplitDVIProtocolError, match="draft_length 5 > num_logits"):
         V.verify(logits, ["r0"], [1, 2, 3, 4, 5], [5], [0, 4])
-    with pytest.raises(ValueError, match="zero logit rows"):
+    with pytest.raises(SplitDVIProtocolError, match="zero logit rows"):
         V.verify(logits, ["r0", "r1"], [1, 2, 3, 4], [4, 0], [0, 4, 4])

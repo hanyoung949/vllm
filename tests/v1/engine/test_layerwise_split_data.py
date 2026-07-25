@@ -3,7 +3,11 @@
 
 import torch
 
-from vllm.v1.engine.split_data import SplitTensorPacket, SplitTokenPacket
+from vllm.v1.engine.split_data import (
+    SplitDVIProtocolError,
+    SplitTensorPacket,
+    SplitTokenPacket,
+)
 
 
 def test_split_tensor_packet_roundtrip_fp16():
@@ -76,8 +80,8 @@ def test_split_token_packet_wrong_shape_raises():
     wrong = torch.tensor([42, 12345], dtype=torch.int32)
     try:
         SplitTokenPacket.from_token_tensor(req_ids=["a", "b"], token_tensor=wrong)
-        assert False, "Expected ValueError"
-    except ValueError:
+        assert False, "Expected SplitDVIProtocolError"
+    except SplitDVIProtocolError:
         pass
 
 
@@ -123,14 +127,14 @@ def test_split_token_packet_v2_req_count_mismatch_raises():
 
     try:
         restored.to_tensors(device="cpu", num_reqs=3, max_sample_len=1)
-        assert False, "Expected ValueError for req count mismatch"
-    except ValueError:
+        assert False, "Expected SplitDVIProtocolError for req count mismatch"
+    except SplitDVIProtocolError:
         pass
 
     try:
         restored.validate_req_ids(["req_0", "req_1", "req_2"])
-        assert False, "Expected ValueError for validate_req_ids count mismatch"
-    except ValueError:
+        assert False, "Expected SplitDVIProtocolError for validate_req_ids count mismatch"
+    except SplitDVIProtocolError:
         pass
 
 
@@ -146,6 +150,6 @@ def test_split_token_packet_v2_req_order_mismatch_raises():
     # Same set, wrong order: must fail fast.
     try:
         packet.validate_req_ids(["req_1", "req_0", "req_2"])
-        assert False, "Expected ValueError for req order mismatch"
-    except ValueError:
+        assert False, "Expected SplitDVIProtocolError for req order mismatch"
+    except SplitDVIProtocolError:
         pass

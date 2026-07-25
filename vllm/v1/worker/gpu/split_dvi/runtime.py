@@ -34,6 +34,7 @@ from vllm.config.split_dvi import SplitDVIConfig
 from vllm.distributed.parallel_state import get_pp_group
 from vllm.logger import init_logger
 from vllm.sequence import IntermediateTensors
+from vllm.v1.engine.split_data import SplitDVIProtocolError
 from vllm.v1.worker.gpu.input_batch import get_num_sampled_and_rejected
 from vllm.v1.worker.gpu.split_dvi.block_verifier import (
     SplitDVIGreedyBlockVerifier,
@@ -168,7 +169,10 @@ class SplitDVIRuntime:
             violation = check_sampling_params_supported(sampling_params)
             if violation is not None:
                 # v1 fail-fast: unsupported sampling would silently diverge
-                # from the greedy baseline, so reject at admission.
+                # from the greedy baseline, so reject at admission.  This is
+                # a request-level config error, NOT a protocol violation, so
+                # it stays a plain ValueError (engine-fatal is reserved for
+                # cross-stage desync via SplitDVIProtocolError).
                 raise ValueError(
                     f"SplitDVI unsupported sampling for request {req_id!r}: "
                     f"{violation}. Greedy-only (temperature=0) in v1."
@@ -315,41 +319,41 @@ class SplitDVIRuntime:
         dvi = metadata.get("dvi")
         packet_req_ids = metadata.get("req_ids")
         if packet_req_ids is not None and packet_req_ids != list(input_batch.req_ids):
-            raise ValueError(
+            raise SplitDVIProtocolError(
                 f"DVI packet req_ids {packet_req_ids!r} != local batch "
                 f"{list(input_batch.req_ids)!r}"
             )
         if dvi is None:
             if local_has_spec:
-                raise ValueError(
+                raise SplitDVIProtocolError(
                     "DVI desync: local batch has spec-booked rows but the "
                     "incoming packet is NORMAL"
                 )
             return
         if not local_has_spec:
-            raise ValueError(
+            raise SplitDVIProtocolError(
                 "DVI desync: incoming DVI_BLOCK packet but local batch has no "
                 "spec-booked rows"
             )
         cycle_ids = dvi.get("cycle_ids")
         if cycle_ids is None:
-            raise ValueError("DVI block metadata missing cycle_ids")
+            raise SplitDVIProtocolError("DVI block metadata missing cycle_ids")
         self.tracker.validate_cycles(list(input_batch.req_ids), cycle_ids)
         generation_ids = dvi.get("generation_ids")
         if generation_ids is None:
-            raise ValueError("DVI block metadata missing generation_ids")
+            raise SplitDVIProtocolError("DVI block metadata missing generation_ids")
         self.tracker.validate_generations(
             list(input_batch.req_ids), generation_ids
         )
         if "draft_positions" not in dvi:
-            raise ValueError("DVI block metadata missing draft_positions")
+            raise SplitDVIProtocolError("DVI block metadata missing draft_positions")
         draft_lengths = dvi.get("draft_lengths")
         draft_token_ids = dvi.get("draft_token_ids")
         num_draft_per_req = input_batch.num_draft_tokens_per_req
         if draft_lengths is None or draft_token_ids is None:
-            raise ValueError("DVI block metadata missing draft fields")
+            raise SplitDVIProtocolError("DVI block metadata missing draft fields")
         if len(draft_lengths) != input_batch.num_reqs:
-            raise ValueError(
+            raise SplitDVIProtocolError(
                 f"DVI draft_lengths length {len(draft_lengths)} != num reqs "
                 f"{input_batch.num_reqs}"
             )
@@ -361,12 +365,12 @@ class SplitDVIRuntime:
             for i in range(input_batch.num_reqs)
         ]
         if draft_lengths != expected_lengths:
-            raise ValueError(
+            raise SplitDVIProtocolError(
                 f"DVI draft_lengths {draft_lengths} != expected block shape "
                 f"{expected_lengths}"
             )
         if sum(draft_lengths) != len(draft_token_ids):
-            raise ValueError(
+            raise SplitDVIProtocolError(
                 f"DVI draft_token_ids length {len(draft_token_ids)} != "
                 f"sum(draft_lengths) {sum(draft_lengths)}"
             )
@@ -375,14 +379,14 @@ class SplitDVIRuntime:
             if num_scheduled is not None and (
                 sum(num_scheduled) != input_batch.num_tokens
             ):
-                raise ValueError(
+                raise SplitDVIProtocolError(
                     f"DVI block row count {sum(num_scheduled)} != local "
                     f"batch tokens {input_batch.num_tokens}"
                 )
             vocab_size = self.runner.vocab_size
             for token_id in draft_token_ids:
                 if not 0 <= token_id < vocab_size:
-                    raise ValueError(
+                    raise SplitDVIProtocolError(
                         f"DVI draft token id {token_id} out of vocab range"
                     )
         self._incoming_metadata = dvi
@@ -420,7 +424,7 @@ class SplitDVIRuntime:
         sampler output plus the DVI token-packet extras."""
         assert self.is_last_stage and self._verifier is not None
         if not self._incoming_is_dvi_block or self._incoming_metadata is None:
-            raise ValueError("verify_block called without an incoming DVI block")
+            raise SplitDVIProtocolError("verify_block called without an incoming DVI block")
 
         from vllm.v1.worker.gpu.sample.output import SamplerOutput
 

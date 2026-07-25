@@ -25,6 +25,8 @@ from dataclasses import dataclass, field
 
 import torch
 
+from vllm.v1.engine.split_data import SplitDVIProtocolError
+
 
 @dataclass
 class SplitDVIVerificationResult:
@@ -72,24 +74,24 @@ class SplitDVIGreedyBlockVerifier:
         """
         num_reqs = len(req_ids)
         if len(cu_num_logits) != num_reqs + 1:
-            raise ValueError(
+            raise SplitDVIProtocolError(
                 f"cu_num_logits has {len(cu_num_logits)} entries for "
                 f"{num_reqs} requests"
             )
         if len(draft_lengths) != num_reqs:
-            raise ValueError(
+            raise SplitDVIProtocolError(
                 f"draft_lengths has {len(draft_lengths)} entries for "
                 f"{num_reqs} requests"
             )
         if sum(draft_lengths) != len(draft_token_ids):
-            raise ValueError(
+            raise SplitDVIProtocolError(
                 f"draft_token_ids has {len(draft_token_ids)} entries, "
                 f"draft_lengths sum to {sum(draft_lengths)}"
             )
 
         target_ids = target_logits.argmax(dim=-1).tolist()
         if len(target_ids) != cu_num_logits[-1]:
-            raise ValueError(
+            raise SplitDVIProtocolError(
                 f"target_logits has {len(target_ids)} rows but cu_num_logits "
                 f"ends at {cu_num_logits[-1]}"
             )
@@ -103,9 +105,9 @@ class SplitDVIGreedyBlockVerifier:
             num_logits_r = row_end - row_start
             draft_len_r = draft_lengths[r]
             if num_logits_r < 1:
-                raise ValueError(f"request {req_ids[r]!r} has zero logit rows")
+                raise SplitDVIProtocolError(f"request {req_ids[r]!r} has zero logit rows")
             if draft_len_r > num_logits_r:
-                raise ValueError(
+                raise SplitDVIProtocolError(
                     f"request {req_ids[r]!r}: draft_length {draft_len_r} > "
                     f"num_logits {num_logits_r}"
                 )

@@ -574,6 +574,20 @@ class WorkerProcHandle:
         )
 
 
+def _is_engine_fatal(e: BaseException) -> bool:
+    """Errors that must reach the engine core from ANY worker rank.
+
+    Ordinary worker exceptions are only forwarded by the output rank (the
+    busy loop logs and continues otherwise).  Engine-fatal errors — currently
+    only :class:`SplitDVIProtocolError` — must always be forwarded so the
+    engine core aborts all workers instead of silently continuing on
+    provably diverged cross-stage state.
+    """
+    from vllm.v1.engine.split_data import SplitDVIProtocolError
+
+    return isinstance(e, SplitDVIProtocolError)
+
+
 class WorkerProc:
     """Wrapper that runs one Worker in a separate process."""
 
@@ -1027,7 +1041,15 @@ class WorkerProc:
                 logger.exception("WorkerProc hit an exception.")
                 # exception might not be serializable, so we convert it to
                 # string, only for logging purpose.
-                if output_rank is None or self.rank == output_rank:
+                if (
+                    output_rank is None
+                    or self.rank == output_rank
+                    or _is_engine_fatal(e)
+                ):
+                    # Engine-fatal errors (e.g. SplitDVIProtocolError) are
+                    # forwarded from EVERY rank: swallowing one on a
+                    # non-output rank lets the engine keep running on
+                    # provably diverged cross-stage state.
                     self.handle_output(e)
 
     @staticmethod

@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from vllm.v1.engine.split_data import (
+    SplitDVIProtocolError,
     SplitPacketKind,
     SplitTensorPacket,
     SplitTokenPacket,
@@ -86,7 +87,7 @@ def test_normal_packet_round_trip_and_no_dvi_fields():
     assert decoded.generation_ids is None
     assert decoded.draft_positions is None
     decoded.validate(expected_req_ids=["a"])
-    with pytest.raises(ValueError, match="DVI metadata is set"):
+    with pytest.raises(SplitDVIProtocolError, match="DVI metadata is set"):
         SplitTensorPacket(
             req_ids=["a"],
             num_scheduled_tokens=[1],
@@ -170,20 +171,20 @@ def test_dvi_block_validation_failures(overrides, match):
     )
     data.update(overrides)
     bad = SplitTensorPacket(**data)
-    with pytest.raises(ValueError, match=match):
+    with pytest.raises(SplitDVIProtocolError, match=match):
         bad.validate(vocab_size=100, max_draft_length=8)
 
 
 def test_dvi_block_row_count_mismatch():
     packet = _dvi_tensor_packet(num_reqs=2, k=4)
     packet.tensors["hidden_states"] = torch.randn(7, 8)
-    with pytest.raises(ValueError, match="rows"):
+    with pytest.raises(SplitDVIProtocolError, match="rows"):
         packet.validate()
 
 
 def test_req_ids_mismatch_fails():
     packet = _dvi_tensor_packet()
-    with pytest.raises(ValueError, match="req_ids mismatch"):
+    with pytest.raises(SplitDVIProtocolError, match="req_ids mismatch"):
         packet.validate(expected_req_ids=["x", "y"])
 
 
@@ -230,25 +231,25 @@ def test_dvi_token_packet_version_echo():
     decoded.validate_dvi(
         expected_policy_version="pol_v11", expected_draft_version="draft_v3"
     )
-    with pytest.raises(ValueError, match="policy_version mismatch"):
+    with pytest.raises(SplitDVIProtocolError, match="policy_version mismatch"):
         decoded.validate_dvi(expected_policy_version="pol_v12")
-    with pytest.raises(ValueError, match="draft_version mismatch"):
+    with pytest.raises(SplitDVIProtocolError, match="draft_version mismatch"):
         decoded.validate_dvi(expected_draft_version="draft_v4")
 
 
 def test_dvi_token_packet_cycle_mismatch():
     packet = _dvi_token_packet()
-    with pytest.raises(ValueError, match="cycle mismatch"):
+    with pytest.raises(SplitDVIProtocolError, match="cycle mismatch"):
         packet.validate_dvi(expected_cycle_ids=[4, 3])
 
 
 def test_dvi_token_packet_generation_mismatch():
     packet = _dvi_token_packet()
-    with pytest.raises(ValueError, match="generation mismatch"):
+    with pytest.raises(SplitDVIProtocolError, match="generation mismatch"):
         packet.validate_dvi(expected_generation_ids=[0, 1])
     packet2 = _dvi_token_packet()
     packet2.generation_ids = None
-    with pytest.raises(ValueError, match="generation_ids"):
+    with pytest.raises(SplitDVIProtocolError, match="generation_ids"):
         packet2.validate_dvi()
 
 
@@ -256,22 +257,22 @@ def test_dvi_token_packet_structure_failures():
     # Missing cycle ids.
     packet = _dvi_token_packet()
     packet.cycle_ids = None
-    with pytest.raises(ValueError, match="cycle_ids"):
+    with pytest.raises(SplitDVIProtocolError, match="cycle_ids"):
         packet.validate_dvi()
     # Duplicate req ids.
     packet = _dvi_token_packet()
     packet.req_ids = ["r0", "r0"]
-    with pytest.raises(ValueError, match="duplicate"):
+    with pytest.raises(SplitDVIProtocolError, match="duplicate"):
         packet.validate_dvi()
     # num_sampled exceeds padded list.
     packet = _dvi_token_packet()
     packet.num_sampled = [5, 1]
-    with pytest.raises(ValueError, match="num_sampled"):
+    with pytest.raises(SplitDVIProtocolError, match="num_sampled"):
         packet.validate_dvi()
     # Negative num_rejected.
     packet = _dvi_token_packet()
     packet.num_rejected = [1, -1]
-    with pytest.raises(ValueError, match="num_rejected"):
+    with pytest.raises(SplitDVIProtocolError, match="num_rejected"):
         packet.validate_dvi()
 
 

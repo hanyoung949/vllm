@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from vllm.logger import init_logger
+from vllm.v1.engine.split_data import SplitDVIProtocolError
 
 logger = init_logger(__name__)
 
@@ -66,7 +67,7 @@ class SplitDVIStateTracker:
         request.  Called identically on every stage."""
         state = self.states.get(req_id)
         if state is None:
-            raise ValueError(
+            raise SplitDVIProtocolError(
                 f"DVI cycle advanced for untracked request {req_id!r}; the "
                 f"request must be registered on addition on every stage"
             )
@@ -87,7 +88,7 @@ class SplitDVIStateTracker:
         for req_id in req_ids:
             state = self.states.get(req_id)
             if state is None:
-                raise ValueError(
+                raise SplitDVIProtocolError(
                     f"DVI state tracker has no state for request {req_id!r} "
                     f"(known: {len(self.states)})"
                 )
@@ -100,7 +101,7 @@ class SplitDVIStateTracker:
         for req_id in req_ids:
             state = self.states.get(req_id)
             if state is None:
-                raise ValueError(
+                raise SplitDVIProtocolError(
                     f"DVI state tracker has no state for request {req_id!r}"
                 )
             result.append(state.generation_id)
@@ -110,7 +111,7 @@ class SplitDVIStateTracker:
         """Fail fast if packet cycle ids diverge from local counters."""
         expected = self.cycle_ids_for(req_ids)
         if cycle_ids != expected:
-            raise ValueError(
+            raise SplitDVIProtocolError(
                 f"DVI cycle desync: local cycles {expected}, packet carries "
                 f"{cycle_ids} (req_ids={req_ids!r})"
             )
@@ -121,7 +122,7 @@ class SplitDVIStateTracker:
         """Fail fast if packet generation epochs are stale or diverged."""
         expected = self.generation_ids_for(req_ids)
         if generation_ids != expected:
-            raise ValueError(
+            raise SplitDVIProtocolError(
                 f"DVI generation desync: local generations {expected}, "
                 f"packet carries {generation_ids} (req_ids={req_ids!r})"
             )
@@ -130,7 +131,7 @@ class SplitDVIStateTracker:
         for req_id in req_ids:
             state = self.states.get(req_id)
             if state is None or not state.awaiting_result:
-                raise ValueError(
+                raise SplitDVIProtocolError(
                     f"DVI result received for request {req_id!r} which is not "
                     f"awaiting a result (phase="
                     f"{state.phase if state else 'missing'})"

@@ -16,7 +16,11 @@ import pytest
 
 from vllm.config.split_dvi import SplitDVIConfig
 from vllm.sampling_params import SamplingParams
-from vllm.v1.engine.split_data import SplitPacketKind, SplitTokenPacket
+from vllm.v1.engine.split_data import (
+    SplitDVIProtocolError,
+    SplitPacketKind,
+    SplitTokenPacket,
+)
 from vllm.v1.worker.gpu.split_dvi.request_state import SplitDVIStateTracker
 from vllm.v1.worker.gpu.split_dvi.runtime import (
     SplitDVIRuntime,
@@ -179,7 +183,7 @@ def test_duplicate_result_rejected_by_awaiting():
 
     packet = _packet(cycle=1, gen=0)
     runtime.validate_token_packet(packet)  # first result: OK, marks READY
-    with pytest.raises(ValueError, match="not awaiting"):
+    with pytest.raises(SplitDVIProtocolError, match="not awaiting"):
         # Same packet arriving twice (duplicate): cycle/generation match but
         # the request is not awaiting a result anymore.
         runtime.validate_token_packet(packet)
@@ -200,7 +204,7 @@ def test_result_for_wrong_cycle_rejected():
     tracker.on_request_added("r0", generation_id=0)
     tracker.advance_cycle("r0")
     runtime = _runtime_for_tracker(tracker)
-    with pytest.raises(ValueError, match="cycle mismatch"):
+    with pytest.raises(SplitDVIProtocolError, match="cycle mismatch"):
         runtime.validate_token_packet(_packet(cycle=7, gen=0))
 
 
