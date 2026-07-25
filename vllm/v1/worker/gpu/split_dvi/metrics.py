@@ -59,6 +59,9 @@ class DVIMetrics:
     block_serialize_ms: float = 0.0
     block_bytes: int = 0
     cycle_wall_ms: float = 0.0
+    # Number of unsettled draft CUDA event pairs dropped by the hard cap;
+    # nonzero means draft_cuda_ms is a lower bound.
+    draft_events_dropped: int = 0
     # Denominators for per-event averages: wall-clock cycles completed on
     # this stage and DVI block packets serialized here (``cycles`` only
     # counts stage_2 verifications, so it cannot serve for these).
@@ -98,8 +101,12 @@ class DVIMetrics:
                 self._draft_cuda_settled_ms += s.elapsed_time(e)
             else:
                 remaining.append((s, e))
-        # Hard cap as a safety net (e.g. events orphaned by an abort).
-        self._draft_events = remaining[-128:]
+        # Hard cap as a safety net (e.g. events orphaned by an abort);
+        # dropped counts are reported at flush, never silently lost.
+        if len(remaining) > 128:
+            self.draft_events_dropped += len(remaining) - 128
+            remaining = remaining[-128:]
+        self._draft_events = remaining
 
     def draft_cuda_ms(self) -> float:
         """Total draft-loop GPU time (ms); syncs only on unsettled events."""
@@ -185,8 +192,8 @@ class DVIMetrics:
             "mean_advancement=%.3f first_token_reject_rate=%.3f "
             "mean_acceptance=%.3f sampled_hist=%s sampled_per_cycle=%.3f "
             "cycle_wall_ms_avg=%.2f unclosed_wall=%d draft_wall_ms=%.1f "
-            "draft_cuda_ms=%.1f verify_wall_ms=%.1f block_serialize_ms=%.2f "
-            "block_bytes_avg=%.0f",
+            "draft_cuda_ms=%.1f draft_events_dropped=%d verify_wall_ms=%.1f "
+            "block_serialize_ms=%.2f block_bytes_avg=%.0f",
             self.stage,
             self.cycles,
             self.verified_requests,
@@ -200,6 +207,7 @@ class DVIMetrics:
             len(self._pending_wall),
             self.draft_wall_ms,
             self.draft_cuda_ms(),
+            self.draft_events_dropped,
             self.verify_wall_ms,
             self.block_serialize_ms,
             self.block_bytes / max(self.block_count, 1),

@@ -150,6 +150,25 @@ def test_config_without_kv_connector_ok():
     assert cfg.split_dvi_config.enabled
 
 
+def test_hybrid_linear_attention_rejected():
+    from vllm.engine.arg_utils import EngineArgs
+
+    with pytest.raises(ValueError, match="hybrid/linear-attention"):
+        EngineArgs(
+            model="/root/workspace/models/Qwen3.5-2B",
+            enforce_eager=True,
+            max_model_len=64,
+            gpu_memory_utilization=0.3,
+            tensor_parallel_size=1,
+            pipeline_parallel_size=3,
+            enable_layerwise_split=True,
+            split_stage_0_size=2,
+            split_stage_2_size=2,
+            split_stage_1_tensor_parallel_size=1,
+            split_dvi_config={"enabled": True, "draft_length": 4},
+        ).create_engine_config()
+
+
 # ----------------------------------------------------------------------
 # awaiting-result invariant
 # ----------------------------------------------------------------------

@@ -89,6 +89,7 @@ def test_draft_events_settle_and_cap():
     for _ in range(200):
         m.record_draft_events(_Ev(0, done=False), _Ev(1, done=False))
     assert len(m._draft_events) <= 128
+    assert m.draft_events_dropped > 0
 
 
 def test_cycle_wall_keyed_pairing():

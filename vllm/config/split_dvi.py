@@ -170,6 +170,15 @@ class SplitDVIConfig:
                 "SplitDVI v1 does not support MoE models (the draft loop "
                 "does not drive EPLB rebalancing)"
             )
+        if model_config is not None and _has_linear_attention_layers(
+            model_config
+        ):
+            raise ValueError(
+                "SplitDVI v1 does not support hybrid/linear-attention models "
+                "(e.g. Qwen3.5): the draft loop and native_rollback are built "
+                "on KV-block attention semantics; recurrent-state layers have "
+                "no KV blocks to write or roll back"
+            )
         if (
             model_config is not None
             and getattr(model_config, "is_multimodal_model", False)
@@ -208,6 +217,28 @@ class SplitDVIConfig:
                 "so remote-KV load/sync semantics are undefined. Disable the "
                 "KV connector or the DRAFT path."
             )
+
+
+def _has_linear_attention_layers(model_config: Any) -> bool:
+    """Detect hybrid models mixing recurrent-state (mamba-style) layers.
+
+    Checks ``layer_types`` on the HF config (or its ``text_config`` for
+    multimodal wrappers) for known recurrent-state kinds; KV-cache-based
+    variants such as sliding-window attention are left alone.
+    """
+    recurrent = {
+        "linear_attention",
+        "mamba",
+        "mamba2",
+        "recurrent",
+        "gated_delta_net",
+    }
+    hf = getattr(model_config, "hf_config", None)
+    for cfg in (hf, getattr(hf, "text_config", None)):
+        layer_types = getattr(cfg, "layer_types", None)
+        if layer_types and any(t in recurrent for t in layer_types):
+            return True
+    return False
 
 
 def materialize_split_dvi_speculative_config(
