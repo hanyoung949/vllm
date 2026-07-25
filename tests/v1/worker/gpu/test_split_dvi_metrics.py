@@ -67,6 +67,46 @@ def test_record_block_accumulates():
     assert m.block_serialize_ms == 2.0
 
 
+def test_record_block_zero_still_emits(monkeypatch):
+    calls = []
+
+    class _Logger:
+        def info(self, *args):
+            calls.append(args)
+
+    monkeypatch.setattr(
+        "vllm.v1.worker.gpu.split_dvi.metrics.logger", _Logger()
+    )
+    m = DVIMetrics(stage="stage_0", log_interval_cycles=1000)
+    m.record_block(1024, 0.5)
+    m.flush()
+    assert len(calls) == 1
+    # A mutation touching only block_count (zero bytes / zero ms) is still a
+    # real mutation: the snapshot must not suppress the next emission.
+    m.record_block(0, 0.0)
+    m.flush()
+    assert len(calls) == 2
+
+
+def test_note_block_serialized_warmup_guard():
+    from unittest import mock
+
+    from vllm.v1.worker.gpu.split_dvi.runtime import SplitDVIRuntime
+
+    runtime = SplitDVIRuntime.__new__(SplitDVIRuntime)
+    runtime.metrics = DVIMetrics(stage="stage_0")
+
+    runtime.runner = mock.Mock(in_warmup=True)
+    runtime.note_block_serialized(1.0, 100)
+    assert runtime.metrics.block_count == 0
+    assert runtime.metrics.block_bytes == 0
+
+    runtime.runner = mock.Mock(in_warmup=False)
+    runtime.note_block_serialized(1.0, 100)
+    assert runtime.metrics.block_count == 1
+    assert runtime.metrics.block_bytes == 100
+
+
 def test_draft_events_settle_and_cap():
     class _Ev:
         def __init__(self, ms, done=True):

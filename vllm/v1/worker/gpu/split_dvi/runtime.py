@@ -552,9 +552,15 @@ class SplitDVIRuntime:
         """Metrics sink for the split tensor transport (DVI block packets).
 
         Skipped for synthetic warmup batches, same as record_verification /
-        record_fallback.  Note block_count counts every DVI-kind block,
-        including FALLBACK blocks (draft-free packets): on a healthy run
-        ``block_count == draft_cycles + fallback_cycles``.
+        record_fallback.  Scope note: the identity
+
+            block_count == draft_cycles + fallback_cycles
+
+        holds ONLY on stage_0's final flush (stage_0 is the only stage that
+        both runs draft loops and emits fallback blocks; stage_1 counts
+        forwarded blocks, stage_2 counts verifications, each with their own
+        denominators).  Batch runners must apply the assertion to stage_0's
+        terminal metrics line only, not to every DVI_METRICS row.
         """
         if self.metrics is not None and not getattr(
             self.runner, "in_warmup", False
