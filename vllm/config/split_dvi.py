@@ -170,9 +170,7 @@ class SplitDVIConfig:
                 "SplitDVI v1 does not support MoE models (the draft loop "
                 "does not drive EPLB rebalancing)"
             )
-        if model_config is not None and _has_linear_attention_layers(
-            model_config
-        ):
+        if model_config is not None and _has_recurrent_state(model_config):
             raise ValueError(
                 "SplitDVI v1 does not support hybrid/linear-attention models "
                 "(e.g. Qwen3.5): the draft loop and native_rollback are built "
@@ -219,13 +217,18 @@ class SplitDVIConfig:
             )
 
 
-def _has_linear_attention_layers(model_config: Any) -> bool:
-    """Detect hybrid models mixing recurrent-state (mamba-style) layers.
+def _has_recurrent_state(model_config: Any) -> bool:
+    """Detect models with recurrent-state (mamba-style) layers.
 
-    Checks ``layer_types`` on the HF config (or its ``text_config`` for
-    multimodal wrappers) for known recurrent-state kinds; KV-cache-based
-    variants such as sliding-window attention are left alone.
+    Primary: vLLM's model-info capability flags (covers families without
+    ``layer_types``).  Fallback: exact ``layer_types`` strings on the HF
+    config (or its ``text_config``) for families the flags miss.
+    KV-cache-based variants such as sliding-window attention are allowed.
     """
+    if getattr(model_config, "has_inner_state", False):
+        return True
+    if getattr(model_config, "is_attention_free", False):
+        return True
     recurrent = {
         "linear_attention",
         "mamba",

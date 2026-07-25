@@ -63,10 +63,12 @@ class DVIMetrics:
     # nonzero means draft_cuda_ms is a lower bound.
     draft_events_dropped: int = 0
     # Denominators for per-event averages: wall-clock cycles completed on
-    # this stage and DVI block packets serialized here (``cycles`` only
-    # counts stage_2 verifications, so it cannot serve for these).
+    # this stage, DVI block packets serialized here, and draft loops run
+    # here (``cycles`` only counts stage_2 verifications, so it cannot
+    # serve for these).
     wall_cycles: int = 0
     block_count: int = 0
+    draft_cycles: int = 0
     # stage_0 draft-loop GPU time from CUDA events; pairs are settled
     # eagerly via non-blocking query so the list stays bounded, and only
     # unsettled pairs are read (sync) at flush time.
@@ -78,7 +80,8 @@ class DVIMetrics:
     _pending_wall: dict = field(default_factory=dict, repr=False)
 
     _last_flush_snapshot: tuple = field(
-        default=(0, 0, 0, 0, 0.0, 0.0, 0.0, 0, 0.0), repr=False
+        default=(0, 0, 0, 0, 0.0, 0.0, 0.0, 0, 0.0, 0, 0.0, 0, 0),
+        repr=False,
     )
 
     def cycle_start(self, req_ids: list, cycle_ids: list) -> None:
@@ -94,6 +97,7 @@ class DVIMetrics:
 
     def record_draft_events(self, start, end) -> None:
         """Stash a CUDA event pair and eagerly settle completed ones."""
+        self.draft_cycles += 1
         self._draft_events.append((start, end))
         remaining = []
         for s, e in self._draft_events:
@@ -166,11 +170,10 @@ class DVIMetrics:
         return self.sampled_tokens / max(self.cycles, 1)
 
     def flush(self) -> None:
-        # Cumulative snapshot; never emit the same snapshot twice.  Compare
-        # every mutable field that appears in the log line (counters AND
-        # timing/byte accumulators): a fallback-only or cycle_end-only change
-        # between flushes must still produce one more emission, and workers
-        # with no activity at all stay silent.
+        # Cumulative snapshot; never emit the same snapshot twice.  The
+        # snapshot covers every mutable field feeding the log line
+        # (counters, timing/byte accumulators, drop/pending counters), so
+        # any visible change always produces exactly one more emission.
         snapshot = (
             self.cycles,
             self.fallback_cycles,
@@ -181,9 +184,13 @@ class DVIMetrics:
             self.block_serialize_ms,
             self.block_bytes,
             self.cycle_wall_ms,
+            self.draft_events_dropped,
+            self._draft_cuda_settled_ms,
+            len(self._draft_events),
+            len(self._pending_wall),
         )
         if snapshot == self._last_flush_snapshot or snapshot == (
-            0, 0, 0, 0, 0.0, 0.0, 0.0, 0, 0.0
+            0, 0, 0, 0, 0.0, 0.0, 0.0, 0, 0.0, 0, 0.0, 0, 0
         ):
             return
         self._last_flush_snapshot = snapshot
@@ -191,9 +198,11 @@ class DVIMetrics:
             "DVI_METRICS stage=%s cycles=%d dvi_reqs=%d fallbacks=%d "
             "mean_advancement=%.3f first_token_reject_rate=%.3f "
             "mean_acceptance=%.3f sampled_hist=%s sampled_per_cycle=%.3f "
-            "cycle_wall_ms_avg=%.2f unclosed_wall=%d draft_wall_ms=%.1f "
-            "draft_cuda_ms=%.1f draft_events_dropped=%d verify_wall_ms=%.1f "
-            "block_serialize_ms=%.2f block_bytes_avg=%.0f",
+            "cycle_wall_ms_avg=%.2f wall_cycles=%d unclosed_wall=%d "
+            "draft_cycles=%d draft_wall_ms_avg=%.2f draft_cuda_ms_avg=%.2f "
+            "draft_events_dropped=%d "
+            "verify_wall_ms_avg=%.2f block_serialize_ms_avg=%.2f "
+            "block_count=%d block_bytes_avg=%.0f",
             self.stage,
             self.cycles,
             self.verified_requests,
@@ -204,11 +213,14 @@ class DVIMetrics:
             dict(sorted(self.sampled_hist.items())),
             self.sampled_per_cycle,
             self.cycle_wall_ms / max(self.wall_cycles, 1),
+            self.wall_cycles,
             len(self._pending_wall),
-            self.draft_wall_ms,
-            self.draft_cuda_ms(),
+            self.draft_cycles,
+            self.draft_wall_ms / max(self.draft_cycles, 1),
+            self.draft_cuda_ms() / max(self.draft_cycles, 1),
             self.draft_events_dropped,
-            self.verify_wall_ms,
-            self.block_serialize_ms,
+            self.verify_wall_ms / max(self.cycles, 1),
+            self.block_serialize_ms / max(self.block_count, 1),
+            self.block_count,
             self.block_bytes / max(self.block_count, 1),
         )
