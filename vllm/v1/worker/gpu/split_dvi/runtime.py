@@ -549,8 +549,16 @@ class SplitDVIRuntime:
             self.metrics.cycle_end(list(packet.req_ids), list(packet.cycle_ids))
 
     def note_block_serialized(self, serialize_ms: float, num_bytes: int) -> None:
-        """Metrics sink for the split tensor transport (DVI block packets)."""
-        if self.metrics is not None:
+        """Metrics sink for the split tensor transport (DVI block packets).
+
+        Skipped for synthetic warmup batches, same as record_verification /
+        record_fallback.  Note block_count counts every DVI-kind block,
+        including FALLBACK blocks (draft-free packets): on a healthy run
+        ``block_count == draft_cycles + fallback_cycles``.
+        """
+        if self.metrics is not None and not getattr(
+            self.runner, "in_warmup", False
+        ):
             self.metrics.record_block(num_bytes, serialize_ms)
 
     def note_dvi_result_received(self, req_ids: list[str]) -> None:

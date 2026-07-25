@@ -169,6 +169,49 @@ def test_hybrid_linear_attention_rejected():
         ).create_engine_config()
 
 
+class TestRecurrentStateGate:
+    """Focused checks of _has_recurrent_state: capability flags first,
+    layer_types as fallback, sliding-window attention untouched."""
+
+    def test_has_inner_state_rejects(self):
+        from unittest import mock
+
+        from vllm.config.split_dvi import _has_recurrent_state
+
+        mc = mock.Mock(has_inner_state=True, is_attention_free=False)
+        assert _has_recurrent_state(mc) is True
+
+    def test_is_attention_free_rejects(self):
+        from unittest import mock
+
+        from vllm.config.split_dvi import _has_recurrent_state
+
+        mc = mock.Mock(has_inner_state=False, is_attention_free=True)
+        assert _has_recurrent_state(mc) is True
+
+    def test_layer_types_fallback_rejects(self):
+        from unittest import mock
+
+        from vllm.config.split_dvi import _has_recurrent_state
+
+        hf = mock.Mock(text_config=None, layer_types=["linear_attention", "full_attention"])
+        mc = mock.Mock(
+            has_inner_state=False, is_attention_free=False, hf_config=hf
+        )
+        assert _has_recurrent_state(mc) is True
+
+    def test_sliding_window_allowed(self):
+        from unittest import mock
+
+        from vllm.config.split_dvi import _has_recurrent_state
+
+        hf = mock.Mock(text_config=None, layer_types=["sliding_attention", "full_attention"])
+        mc = mock.Mock(
+            has_inner_state=False, is_attention_free=False, hf_config=hf
+        )
+        assert _has_recurrent_state(mc) is False
+
+
 # ----------------------------------------------------------------------
 # awaiting-result invariant
 # ----------------------------------------------------------------------

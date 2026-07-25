@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from typing import ClassVar
 
 from vllm.logger import init_logger
 
@@ -79,9 +80,9 @@ class DVIMetrics:
     # overwrite.  Leftover keys at flush indicate an unanswered block.
     _pending_wall: dict = field(default_factory=dict, repr=False)
 
-    _last_flush_snapshot: tuple = field(
-        default=(0, 0, 0, 0, 0.0, 0.0, 0.0, 0, 0.0, 0, 0.0, 0, 0),
-        repr=False,
+    _last_flush_snapshot: tuple | None = field(default=None, repr=False)
+    _zero: ClassVar[tuple] = (
+        0, 0, 0, 0, 0, 0, 0, 0, (), 0, 0, 0, 0.0, 0.0, 0.0, 0, 0.0, 0, 0.0, 0, 0
     )
 
     def cycle_start(self, req_ids: list, cycle_ids: list) -> None:
@@ -171,14 +172,22 @@ class DVIMetrics:
 
     def flush(self) -> None:
         # Cumulative snapshot; never emit the same snapshot twice.  The
-        # snapshot covers every mutable field feeding the log line
-        # (counters, timing/byte accumulators, drop/pending counters), so
-        # any visible change always produces exactly one more emission.
+        # snapshot covers EVERY mutable field of the metrics state (no
+        # inferred "usually changes together" assumptions), so any mutation
+        # at all produces exactly one more emission.
         snapshot = (
             self.cycles,
             self.fallback_cycles,
-            self.verified_requests,
+            self.drafted_tokens,
+            self.accepted_tokens,
             self.sampled_tokens,
+            self.verified_requests,
+            self.dvi_sampled_tokens,
+            self.dvi_first_token_rejects,
+            tuple(sorted(self.sampled_hist.items())),
+            self.wall_cycles,
+            self.block_count,
+            self.draft_cycles,
             self.draft_wall_ms,
             self.verify_wall_ms,
             self.block_serialize_ms,
@@ -189,9 +198,7 @@ class DVIMetrics:
             len(self._draft_events),
             len(self._pending_wall),
         )
-        if snapshot == self._last_flush_snapshot or snapshot == (
-            0, 0, 0, 0, 0.0, 0.0, 0.0, 0, 0.0, 0, 0.0, 0, 0
-        ):
+        if snapshot == self._last_flush_snapshot or snapshot == self._zero:
             return
         self._last_flush_snapshot = snapshot
         logger.info(
