@@ -588,3 +588,15 @@ class SplitDVIRuntime:
         """
         if self.metrics is not None:
             self.metrics.flush()
+
+    def reset_metrics(self) -> None:
+        """Drop all accumulated metrics (benchmark warmup boundary).
+
+        Called by the worker RPC ``reset_dvi_metrics`` after a warmup
+        workload so the measured window starts from clean counters.
+        """
+        if self.metrics is not None:
+            self.metrics = DVIMetrics(
+                stage=self.metrics.stage,
+                log_interval_cycles=self.metrics.log_interval_cycles,
+            )

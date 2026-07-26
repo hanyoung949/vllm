@@ -937,6 +937,16 @@ class Worker(WorkerBase):
     def reset_encoder_cache(self) -> None:
         self.model_runner.reset_encoder_cache()
 
+    def reset_dvi_metrics(self) -> None:
+        """Reset Stage-DVI metrics accumulators on this worker.
+
+        Driver-invoked via collective_rpc at a benchmark's warmup/measured
+        boundary so the measured window starts from clean counters.
+        """
+        runtime = getattr(self.model_runner, "split_dvi_runtime", None)
+        if runtime is not None:
+            runtime.reset_metrics()
+
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()
 
