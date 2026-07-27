@@ -101,6 +101,7 @@ from vllm.v1.worker.gpu.pp_utils import PPHandler
 from vllm.v1.worker.gpu.split_pp_handler import SplitPPHandler
 from vllm.v1.worker.gpu.sample.output import SamplerOutput
 from vllm.v1.worker.gpu.split_dvi.hooks import DVIStage2TelemetryHook
+from vllm.v1.worker.gpu.split_dvi.hooks import DVIStage0TelemetryProbe
 from vllm.v1.worker.gpu.split_dvi.runtime import DVIStepKind
 from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
@@ -299,6 +300,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # DVI L0 telemetry hook (set externally by split-RL driver/worker).
         self.dvi_telemetry_hook: DVIStage2TelemetryHook | None = None
         self.dvi_top_k = 8  # default; updated when hook is injected
+        # DVI L0 stage_0 hidden probe (first split stage only).
+        self.dvi_stage0_probe: DVIStage0TelemetryProbe | None = None
+
+    def set_dvi_stage0_probe(
+        self,
+        probe: DVIStage0TelemetryProbe | None,
+    ) -> None:
+        """Inject (or remove) the stage_0 boundary-hidden capture probe."""
+        self.dvi_stage0_probe = probe
 
     def set_dvi_telemetry_hook(
         self,
@@ -814,6 +824,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         req_idx = self.req_states.remove_request(req_id)
         if req_idx is None:
             return False
+        if self.dvi_stage0_probe is not None:
+            self.dvi_stage0_probe.finalize_request(req_id)
         if self.pp_handler is not None:
             self.pp_handler.on_req_idx_freed(req_idx)
         if self.split_dvi_runtime is not None:
@@ -1622,8 +1634,45 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if not self.is_last_pp_rank:
             # Non-last PP rank: return IntermediateTensors for sending.
+            self._capture_stage0_boundary(input_batch, output_intermediate_tensors)
             return output_intermediate_tensors
         return None
+
+    def _capture_stage0_boundary(
+        self,
+        input_batch: InputBatch,
+        intermediate_tensors: IntermediateTensors,
+    ) -> None:
+        """L0 stage_0 hidden capture (plain split path, minimal sync probe).
+
+        Captures the boundary hidden row for every sampled position using the
+        same response-relative position formula as the stage_2 verifier
+        (``num_computed + num_scheduled - prefill_len``), so both stages emit
+        identical record keys.  Skipped for speculative-decode steps (L0
+        telemetry covers plain greedy decode only).
+        """
+        probe = self.dvi_stage0_probe
+        if probe is None or not probe.enabled:
+            return
+        if input_batch.num_draft_tokens > 0:
+            return
+        hidden = intermediate_tensors.tensors.get("hidden_states")
+        if hidden is None:
+            return
+        logits_indices = input_batch.logits_indices
+        num_computed = input_batch.num_computed_tokens_np
+        num_scheduled = input_batch.num_scheduled_tokens
+        prefill_len = input_batch.prefill_len_np
+        for i, req_id in enumerate(input_batch.req_ids):
+            response_pos = (
+                int(num_computed[i])
+                + int(num_scheduled[i])
+                - int(prefill_len[i])
+            )
+            if response_pos < 0:
+                # Non-final prefill chunk: no sampled row for this request.
+                continue
+            probe.capture(req_id, response_pos, hidden[int(logits_indices[i])])
 
     @torch.inference_mode()
     @step_eplb_after()

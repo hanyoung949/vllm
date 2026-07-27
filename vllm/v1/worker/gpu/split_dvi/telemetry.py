@@ -7,6 +7,42 @@ The spool writer is asynchronous: hook threads call `enqueue_*` with small
 immutable records; a background thread batches and flushes them to disk.
 Telemetry never blocks rollout: when the bounded queue is full, records are
 dropped and counted.
+
+## Frozen contracts (L0)
+
+**Session key**: ``(run_id, rollout_id, policy_version)`` — identifies one
+capture session.  **Record key**: session key + ``(request_id, position)`` —
+identifies one (stage_0 hidden, stage_2 verifier top-k) pair.  Both stages
+compute identical keys for the same logical position; the merger joins on
+exact key equality and reports unmatched records as ``incomplete``.
+
+**Position semantics**: ``position = p`` means the boundary hidden and the
+verifier top-k come from the SAME logits row — the row that PREDICTS
+``response_token_ids[p]``.
+
+- ``p = 0``: the last prefill row (sequence index ``prompt_len - 1``), which
+  predicts the first response token.
+- ``p > 0``: a decode forward whose input includes
+  ``response_token_ids[p-1]`` (row at sequence index ``prompt_len + p - 1``),
+  predicting ``response_token_ids[p]``.
+- Greedy oracle: for every captured record,
+  ``verifier_top1_id == response_token_ids[p]`` must hold.
+
+``position == response_len`` is the **terminal distribution row**: with
+async scheduling, the engine runs one extra forward on the final committed
+token (EOS or max-token) before the finish bookkeeping settles; its sample
+is discarded, but the verifier distribution at that row is real and stays
+in the artifact (verified by the pairing smoke on both EOS- and
+max-token-finish requests).  Greedy oracle comparisons apply only to
+``position < response_len``.
+
+**Capture scope**: L0 capture runs on the plain split path (DVI disabled),
+greedy decode only.  Speculative DVI steps are not a telemetry source.
+
+**Worker ownership**: stage_0 writes only hidden partial records
+(``*.stage_0.*``), stage_2 writes only verifier partial records
+(``*.stage_2.*``); each has exactly one owner worker (first / last PP rank
+with TP rank 0).
 """
 
 from __future__ import annotations
