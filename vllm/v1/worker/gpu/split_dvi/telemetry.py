@@ -28,13 +28,13 @@ verifier top-k come from the SAME logits row — the row that PREDICTS
 - Greedy oracle: for every captured record,
   ``verifier_top1_id == response_token_ids[p]`` must hold.
 
-``position == response_len`` is the **terminal distribution row**: with
-async scheduling, the engine runs one extra forward on the final committed
-token (EOS or max-token) before the finish bookkeeping settles; its sample
-is discarded, but the verifier distribution at that row is real and stays
-in the artifact (verified by the pairing smoke on both EOS- and
-max-token-finish requests).  Greedy oracle comparisons apply only to
-``position < response_len``.
+``position == response_len`` is an optional **terminal distribution row**.
+Async scheduling can run one extra forward on a final committed token before
+finish bookkeeping settles. Its sample is discarded, but the verifier
+distribution is real and stays in the artifact. The pairing smoke observed
+this row for EOS completion; max-token completion stopped without one.
+Greedy oracle comparisons and draft-head train/evaluation samples apply only
+to ``position < response_len``.
 
 **Capture scope**: L0 capture runs on the plain split path (DVI disabled),
 greedy decode only.  Speculative DVI steps are not a telemetry source.
@@ -55,7 +55,7 @@ import queue
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Mapping
 
 import torch
 from safetensors.torch import save_file as save_safetensors
@@ -97,6 +97,171 @@ class DVITelemetryTicket:
 
     key: DVIRecordKey
     priority: int
+
+
+@dataclass(frozen=True)
+class DVITensorSpec:
+    """Shape and CPU dtype of one tensor in an async handoff slot."""
+
+    shape: tuple[int, ...]
+    dtype: torch.dtype
+
+
+@dataclass
+class _HandoffSlot:
+    tensors: dict[str, torch.Tensor]
+    event: torch.cuda.Event
+
+
+@dataclass
+class _PendingHandoff:
+    slot: _HandoffSlot
+    callback: Callable[[Mapping[str, torch.Tensor]], None]
+
+
+class DVIAsyncTensorHandoff:
+    """Bounded pinned-memory CUDA-to-CPU handoff for one telemetry side.
+
+    Slots and CUDA events are allocated when the session starts. submit never
+    waits: it either acquires a free slot, issues nonblocking copies on the
+    current source stream and records the slot event, or reports a drop. A
+    dedicated completion thread waits for events and invokes callbacks; the
+    spool writer remains separate and only sees CPU-ready payloads.
+    """
+
+    def __init__(
+        self,
+        specs: Mapping[str, DVITensorSpec],
+        pool_size: int = 64,
+    ) -> None:
+        if pool_size <= 0:
+            raise DVIArtifactError("handoff pool_size must be positive")
+        if not specs:
+            raise DVIArtifactError("handoff specs must not be empty")
+        self.specs = dict(specs)
+        self.pool_size = pool_size
+        self._free: queue.Queue[_HandoffSlot] = queue.Queue(maxsize=pool_size)
+        self._pending: queue.Queue[_PendingHandoff | None] = queue.Queue()
+        self._lock = threading.Lock()
+        self._closed = False
+        self._worker_error: BaseException | None = None
+        self._accepted = 0
+        self._completed = 0
+        self._dropped = 0
+        self._pending_count = 0
+        self._max_pending = 0
+
+        for _ in range(pool_size):
+            tensors = {
+                name: torch.empty(spec.shape, dtype=spec.dtype, pin_memory=True)
+                for name, spec in self.specs.items()
+            }
+            self._free.put_nowait(
+                _HandoffSlot(tensors=tensors, event=torch.cuda.Event())
+            )
+        self._thread = threading.Thread(
+            target=self._completion_thread,
+            name="dvi-telemetry-handoff",
+            daemon=True,
+        )
+        self._thread.start()
+
+    @property
+    def metrics(self) -> dict[str, int]:
+        with self._lock:
+            return {
+                "handoff_pool_size": self.pool_size,
+                "handoff_accepted": self._accepted,
+                "handoff_completed": self._completed,
+                "handoff_dropped": self._dropped,
+                "handoff_pending": self._pending_count,
+                "handoff_max_pending": self._max_pending,
+            }
+
+    def submit(
+        self,
+        sources: Mapping[str, torch.Tensor],
+        callback: Callable[[Mapping[str, torch.Tensor]], None],
+    ) -> bool:
+        """Issue an asynchronous copy, returning False on backpressure."""
+        with self._lock:
+            if self._closed or self._worker_error is not None:
+                self._dropped += 1
+                return False
+            try:
+                slot = self._free.get_nowait()
+            except queue.Empty:
+                self._dropped += 1
+                return False
+
+            try:
+                source_device: torch.device | None = None
+                for name, spec in self.specs.items():
+                    source = sources.get(name)
+                    if source is None:
+                        raise DVIArtifactError(f"Missing handoff tensor {name!r}")
+                    if not source.is_cuda:
+                        raise DVIArtifactError(
+                            f"Handoff tensor {name!r} must be CUDA, got {source.device}"
+                        )
+                    if tuple(source.shape) != spec.shape:
+                        raise DVIArtifactError(
+                            f"Handoff tensor {name!r} shape {tuple(source.shape)} "
+                            f"does not match {spec.shape}"
+                        )
+                    if source_device is None:
+                        source_device = source.device
+                    elif source.device != source_device:
+                        raise DVIArtifactError(
+                            "Handoff tensors must share one CUDA device"
+                        )
+                    slot.tensors[name].copy_(source.detach(), non_blocking=True)
+                assert source_device is not None
+                slot.event.record(torch.cuda.current_stream(source_device))
+                self._accepted += 1
+                self._pending_count += 1
+                self._max_pending = max(self._max_pending, self._pending_count)
+                self._pending.put_nowait(
+                    _PendingHandoff(slot=slot, callback=callback)
+                )
+                return True
+            except BaseException:
+                self._free.put_nowait(slot)
+                raise
+
+    def _completion_thread(self) -> None:
+        try:
+            while True:
+                item = self._pending.get()
+                if item is None:
+                    break
+                try:
+                    item.slot.event.synchronize()
+                    item.callback(item.slot.tensors)
+                    with self._lock:
+                        self._completed += 1
+                        self._pending_count -= 1
+                finally:
+                    self._free.put_nowait(item.slot)
+        except BaseException as e:  # noqa: BLE001
+            with self._lock:
+                self._worker_error = e
+
+    def close(self) -> dict[str, int]:
+        with self._lock:
+            if self._closed:
+                error = self._worker_error
+            else:
+                self._closed = True
+                self._pending.put_nowait(None)
+                error = None
+        if error is None:
+            self._thread.join(timeout=30.0)
+        if self._thread.is_alive():
+            raise DVIArtifactError("Telemetry handoff thread did not terminate")
+        if self._worker_error is not None:
+            raise self._worker_error
+        return self.metrics
 
 
 def _canonical_bytes(key: DVIRecordKey, salt: str = "") -> bytes:
@@ -252,8 +417,10 @@ class DVIPartialSpoolWriter:
         self._stage2_enqueued = 0
         self._request_enqueued = 0
         self._quota_exceeded = False
+        self._max_queue_depth = 0
         self._closed = False
         self._worker_error: BaseException | None = None
+        self._handoff_metrics: dict[str, int] = {}
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
 
@@ -265,7 +432,7 @@ class DVIPartialSpoolWriter:
 
     @property
     def metrics(self) -> dict[str, int | float | bool]:
-        return {
+        metrics: dict[str, int | float | bool] = {
             "used_bytes": self._used_bytes,
             "quota_bytes": self.quota_bytes,
             "pending_bytes": self._pending_bytes,
@@ -274,7 +441,22 @@ class DVIPartialSpoolWriter:
             "request_enqueued": self._request_enqueued,
             "dropped_records": self._dropped_records,
             "quota_exceeded": self._quota_exceeded,
+            "queue_maxsize": self.queue_maxsize,
+            "queue_depth": self._queue.qsize(),
+            "max_queue_depth": self._max_queue_depth,
         }
+        metrics.update(self._handoff_metrics)
+        return metrics
+
+    def note_handoff_drop(self) -> None:
+        """Account a record rejected by the bounded GPU handoff pool."""
+        with self._lock:
+            self._dropped_records += 1
+
+    def set_handoff_metrics(self, metrics: Mapping[str, int]) -> None:
+        """Attach final handoff counters to the spool manifest."""
+        with self._lock:
+            self._handoff_metrics = dict(metrics)
 
     def _run_id(self) -> str:
         return str(self.spool_metadata.get("run_id", ""))
@@ -339,6 +521,9 @@ class DVIPartialSpoolWriter:
                     self._request_enqueued -= 1
                 self._dropped_records += 1
                 return False
+            self._max_queue_depth = max(
+                self._max_queue_depth, self._queue.qsize()
+            )
             return True
 
     def enqueue_stage0(
@@ -400,9 +585,7 @@ class DVIPartialSpoolWriter:
             if not isinstance(hidden, torch.Tensor):
                 self._dropped_records += 1
                 return
-            hidden = (
-                hidden.detach().to(device="cpu", dtype=torch.float32).contiguous()
-            )
+            hidden = hidden.detach().to(device="cpu").contiguous()
             if item.key is None:
                 self._dropped_records += 1
                 return
@@ -623,6 +806,9 @@ class _RequestBuffer:
         self.stage0: dict[int, torch.Tensor | None] = {}
         self.stage2: dict[int, dict[str, Any] | None] = {}
         self.canceled: set[int] = set()
+        self.pending: set[int] = set()
+        self.finalized_positions: set[int] | None = None
+        self.request_data: tuple[list[int], list[int]] | None = None
 
 
 class DVIStage0TelemetryProducer:
@@ -632,6 +818,7 @@ class DVIStage0TelemetryProducer:
         self,
         writer: DVIPartialSpoolWriter,
         sampling_config: DVISamplingConfig,
+        handoff: DVIAsyncTensorHandoff | None = None,
     ) -> None:
         expected = _sampling_config_from_metadata(writer.spool_metadata)
         if sampling_config != expected:
@@ -642,11 +829,21 @@ class DVIStage0TelemetryProducer:
         self.writer = writer
         self.sampler = DVIPerRequestSampler(sampling_config)
         self._buffers: dict[tuple[str, ...], _RequestBuffer] = {}
+        self._handoff = handoff
+        self._completed: queue.SimpleQueue[
+            tuple[DVITelemetryTicket, torch.Tensor]
+        ] = queue.SimpleQueue()
         self._capture_failed_count = 0
 
     @property
     def capture_failed_count(self) -> int:
         return self._capture_failed_count
+
+    @property
+    def handoff_metrics(self) -> dict[str, int]:
+        if self._handoff is None:
+            return {}
+        return self._handoff.metrics
 
     @property
     def session_key(self) -> DVISessionKey:
@@ -673,6 +870,7 @@ class DVIStage0TelemetryProducer:
         evicts them just like any other selected position, keeping stage_0 and
         stage_2 sample sets consistent.
         """
+        self._drain_completed()
         session_key = key[:3]
         request_id = key[3]
         position = key[4]
@@ -727,13 +925,69 @@ class DVIStage0TelemetryProducer:
         selected = {pos for _, pos in buf.heap}
         if position not in selected or position in buf.canceled:
             return False
-        # NOTE: baseline path performs synchronous GPU->CPU copy here. The
-        # production path will instead enqueue the GPU tensor with a CUDA event
-        # and let the writer thread copy it later.
-        buf.stage0[position] = (
-            hidden.detach().to(device="cpu", dtype=torch.float32).contiguous()
-        )
+        buf.stage0[position] = hidden.detach().to(device="cpu").contiguous()
         return True
+
+    def submit_device(
+        self,
+        ticket: DVITelemetryTicket,
+        hidden: torch.Tensor,
+    ) -> bool:
+        """Submit one CUDA hidden row through the bounded async handoff."""
+        if not hidden.is_cuda:
+            return self.submit(ticket, hidden)
+        if self._handoff is None:
+            raise DVIArtifactError("stage_0 CUDA capture requires an async handoff")
+        session_key = ticket.key[:3]
+        request_id = ticket.key[3]
+        position = ticket.key[4]
+        buf = self._buffers.get(session_key + (request_id,))
+        if buf is None:
+            return False
+        selected = {pos for _, pos in buf.heap}
+        if position not in selected or position in buf.canceled:
+            return False
+
+        def completed(tensors: Mapping[str, torch.Tensor]) -> None:
+            self._completed.put((ticket, tensors["hidden"].clone()))
+
+        ok = self._handoff.submit({"hidden": hidden}, completed)
+        if ok:
+            buf.pending.add(position)
+        else:
+            self.writer.note_handoff_drop()
+        return ok
+
+    def _drain_completed(self) -> None:
+        while True:
+            try:
+                ticket, hidden = self._completed.get_nowait()
+            except queue.Empty:
+                return
+            session_key = ticket.key[:3]
+            request_id = ticket.key[3]
+            position = ticket.key[4]
+            buffer_key = session_key + (request_id,)
+            buf = self._buffers.get(buffer_key)
+            if buf is None:
+                continue
+            buf.pending.discard(position)
+            selected = (
+                buf.finalized_positions
+                if buf.finalized_positions is not None
+                else {pos for _, pos in buf.heap}
+            )
+            if position not in selected or position in buf.canceled:
+                if buf.finalized_positions is not None and not buf.pending:
+                    self._buffers.pop(buffer_key, None)
+                continue
+            if buf.finalized_positions is None:
+                buf.stage0[position] = hidden
+                continue
+            self.writer.enqueue_stage0(ticket.key, hidden)
+            buf.stage0.pop(position, None)
+            if not buf.pending:
+                self._buffers.pop(buffer_key, None)
 
     def cancel(self, ticket: DVITelemetryTicket) -> bool:
         """Mark a reserved capture slot as failed.
@@ -773,18 +1027,35 @@ class DVIStage0TelemetryProducer:
         session_key: DVISessionKey,
         request_id: str,
     ) -> None:
-        buf = self._buffers.pop(session_key + (request_id,), None)
+        self._drain_completed()
+        buffer_key = session_key + (request_id,)
+        buf = self._buffers.get(buffer_key)
         if buf is None:
             return
         selected_positions = set(
             self.sampler.finalize_request(session_key, request_id)
         )
+        buf.finalized_positions = selected_positions
         for position in selected_positions:
+            if position in buf.pending:
+                continue
             hidden = buf.stage0.get(position)
             if hidden is None:
                 continue
             key = session_key + (request_id, position)
             self.writer.enqueue_stage0(key, hidden)
+            buf.stage0.pop(position, None)
+        if not buf.pending:
+            self._buffers.pop(buffer_key, None)
+
+    def close(self) -> dict[str, int]:
+        """Drain async copies and expose final counters to the spool manifest."""
+        metrics: dict[str, int] = {}
+        if self._handoff is not None:
+            metrics = self._handoff.close()
+            self.writer.set_handoff_metrics(metrics)
+        self._drain_completed()
+        return metrics
 
 
 class DVIStage2TelemetryProducer:
@@ -794,6 +1065,7 @@ class DVIStage2TelemetryProducer:
         self,
         writer: DVIPartialSpoolWriter,
         sampling_config: DVISamplingConfig,
+        handoff: DVIAsyncTensorHandoff | None = None,
     ) -> None:
         expected = _sampling_config_from_metadata(writer.spool_metadata)
         if sampling_config != expected:
@@ -804,11 +1076,21 @@ class DVIStage2TelemetryProducer:
         self.writer = writer
         self.sampler = DVIPerRequestSampler(sampling_config)
         self._buffers: dict[tuple[str, ...], _RequestBuffer] = {}
+        self._handoff = handoff
+        self._completed: queue.SimpleQueue[
+            tuple[DVITelemetryTicket, dict[str, Any] | None]
+        ] = queue.SimpleQueue()
         self._capture_failed_count = 0
 
     @property
     def capture_failed_count(self) -> int:
         return self._capture_failed_count
+
+    @property
+    def handoff_metrics(self) -> dict[str, int]:
+        if self._handoff is None:
+            return {}
+        return self._handoff.metrics
 
     @property
     def session_key(self) -> DVISessionKey:
@@ -830,6 +1112,7 @@ class DVIStage2TelemetryProducer:
         evicts them normally, so stage_0 and stage_2 finalize to the same
         deterministic position set.
         """
+        self._drain_completed()
         session_key = key[:3]
         request_id = key[3]
         position = key[4]
@@ -890,6 +1173,110 @@ class DVIStage2TelemetryProducer:
         }
         return True
 
+    def submit_device(
+        self,
+        ticket: DVITelemetryTicket,
+        *,
+        topk_ids: torch.Tensor,
+        topk_logprobs: torch.Tensor,
+        residual_mass: torch.Tensor,
+        top1_id: torch.Tensor,
+        valid_count: torch.Tensor,
+    ) -> bool:
+        """Submit one verifier row through the bounded async handoff."""
+        if not topk_ids.is_cuda:
+            count = int(valid_count)
+            ids = topk_ids[:count].tolist()
+            logprobs = topk_logprobs[:count].tolist()
+            return self.submit(
+                ticket,
+                ids,
+                logprobs,
+                float(residual_mass),
+                int(top1_id),
+            )
+        if self._handoff is None:
+            raise DVIArtifactError("stage_2 CUDA capture requires an async handoff")
+        session_key = ticket.key[:3]
+        request_id = ticket.key[3]
+        position = ticket.key[4]
+        buf = self._buffers.get(session_key + (request_id,))
+        if buf is None:
+            return False
+        selected = {pos for _, pos in buf.heap}
+        if position not in selected or position in buf.canceled:
+            return False
+
+        def completed(tensors: Mapping[str, torch.Tensor]) -> None:
+            count = int(tensors["valid_count"])
+            record: dict[str, Any] | None = None
+            if 0 < count <= len(tensors["topk_ids"]):
+                ids = tensors["topk_ids"][:count].tolist()
+                top1 = int(tensors["top1_id"])
+                if top1 in ids:
+                    record = {
+                        "verifier_topk_ids": tuple(ids),
+                        "verifier_topk_logprobs": tuple(
+                            tensors["topk_logprobs"][:count].tolist()
+                        ),
+                        "verifier_residual_mass": float(tensors["residual_mass"]),
+                        "verifier_top1_id": top1,
+                    }
+            self._completed.put((ticket, record))
+
+        ok = self._handoff.submit(
+            {
+                "topk_ids": topk_ids,
+                "topk_logprobs": topk_logprobs,
+                "residual_mass": residual_mass,
+                "top1_id": top1_id,
+                "valid_count": valid_count,
+            },
+            completed,
+        )
+        if ok:
+            buf.pending.add(position)
+        else:
+            self.writer.note_handoff_drop()
+        return ok
+
+    def _drain_completed(self) -> None:
+        while True:
+            try:
+                ticket, rec = self._completed.get_nowait()
+            except queue.Empty:
+                return
+            session_key = ticket.key[:3]
+            request_id = ticket.key[3]
+            position = ticket.key[4]
+            buffer_key = session_key + (request_id,)
+            buf = self._buffers.get(buffer_key)
+            if buf is None:
+                continue
+            buf.pending.discard(position)
+            selected = (
+                buf.finalized_positions
+                if buf.finalized_positions is not None
+                else {pos for _, pos in buf.heap}
+            )
+            if rec is None:
+                buf.canceled.add(position)
+                self._capture_failed_count += 1
+            elif position in selected and position not in buf.canceled:
+                if buf.finalized_positions is None:
+                    buf.stage2[position] = rec
+                    continue
+                self.writer.enqueue_stage2(
+                    ticket.key,
+                    list(rec["verifier_topk_ids"]),
+                    list(rec["verifier_topk_logprobs"]),
+                    rec["verifier_residual_mass"],
+                    rec["verifier_top1_id"],
+                )
+                buf.stage2.pop(position, None)
+            if buf.finalized_positions is not None and not buf.pending:
+                self._buffers.pop(buffer_key, None)
+
     def cancel(self, ticket: DVITelemetryTicket) -> bool:
         """Mark a reserved verifier slot as failed.
 
@@ -939,14 +1326,19 @@ class DVIStage2TelemetryProducer:
         prompt_token_ids: list[int],
         response_token_ids: list[int],
     ) -> None:
-        buf = self._buffers.pop(session_key + (request_id,), None)
+        self._drain_completed()
+        buffer_key = session_key + (request_id,)
+        buf = self._buffers.get(buffer_key)
         if buf is None:
             return
         self.writer.enqueue_request(request_id, prompt_token_ids, response_token_ids)
         selected_positions = set(
             self.sampler.finalize_request(session_key, request_id)
         )
+        buf.finalized_positions = selected_positions
         for position in selected_positions:
+            if position in buf.pending:
+                continue
             rec = buf.stage2.get(position)
             if rec is None:
                 continue
@@ -958,6 +1350,18 @@ class DVIStage2TelemetryProducer:
                 rec["verifier_residual_mass"],
                 rec["verifier_top1_id"],
             )
+            buf.stage2.pop(position, None)
+        if not buf.pending:
+            self._buffers.pop(buffer_key, None)
+
+    def close(self) -> dict[str, int]:
+        """Drain async copies and expose final counters to the spool manifest."""
+        metrics: dict[str, int] = {}
+        if self._handoff is not None:
+            metrics = self._handoff.close()
+            self.writer.set_handoff_metrics(metrics)
+        self._drain_completed()
+        return metrics
 
 
 def deterministic_hash(key: DVIRecordKey, salt: str = "") -> int:
@@ -966,6 +1370,7 @@ def deterministic_hash(key: DVIRecordKey, salt: str = "") -> int:
 
 
 __all__ = [
+    "DVIAsyncTensorHandoff",
     "DVIPartialSpoolWriter",
     "DVIPerRequestSampler",
     "DVISamplingConfig",
@@ -973,5 +1378,6 @@ __all__ = [
     "DVIStage0TelemetryProducer",
     "DVIStage2TelemetryProducer",
     "DVITelemetryTicket",
+    "DVITensorSpec",
     "deterministic_hash",
 ]

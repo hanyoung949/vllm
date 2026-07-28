@@ -22,16 +22,10 @@ from vllm.v1.worker.gpu.split_dvi.telemetry import (
 class DVIStage2TelemetryHook:
     """Stage-2 hook that captures the processed verifier distribution.
 
-    This is the **baseline synchronous path**. It performs the following steps:
-
-        1. ``reserve(key)`` — cheap deterministic sampling decision.
-        2. If reserved, the caller obtains the *processed* verifier top-k
-           distribution (temperature/top-p/top-k/penalties already applied).
-        3. ``submit(ticket, ...)`` — enqueues the partial record for async flush.
-
-    The baseline path records wall time so that telemetry-on vs telemetry-off
-    A/B can measure overhead. The production path will replace the synchronous
-    ``.tolist()``/enqueue step with a pinned-memory + CUDA-event handoff.
+    reserve is a cheap deterministic sampling decision. CUDA tensors from
+    reserved rows use the producer's bounded pinned-memory/event handoff;
+    already-CPU data keeps a synchronous submission method for tests and
+    offline callers.
     """
 
     def __init__(
@@ -97,6 +91,33 @@ class DVIStage2TelemetryHook:
             self._submitted_count += 1
         return ok
 
+    def submit_device_topk(
+        self,
+        ticket: Any,
+        *,
+        topk_ids: torch.Tensor,
+        topk_logprobs: torch.Tensor,
+        residual_mass: torch.Tensor,
+        top1_id: torch.Tensor,
+        valid_count: torch.Tensor,
+    ) -> bool:
+        """Submit one processed verifier row without synchronizing the runner."""
+        if not self.enabled or ticket is None:
+            return False
+        t0 = time.perf_counter()
+        ok = self.producer.submit_device(
+            ticket,
+            topk_ids=topk_ids,
+            topk_logprobs=topk_logprobs,
+            residual_mass=residual_mass,
+            top1_id=top1_id,
+            valid_count=valid_count,
+        )
+        self._submit_wall_ms += (time.perf_counter() - t0) * 1000.0
+        if ok:
+            self._submitted_count += 1
+        return ok
+
     def cancel(self, ticket: Any) -> bool:
         """Mark a reserved slot as capture-failed.
 
@@ -139,7 +160,7 @@ class DVIStage2TelemetryHook:
 
     @property
     def metrics(self) -> dict[str, float | int]:
-        return {
+        metrics: dict[str, float | int] = {
             "enabled": self.enabled,
             "reserve_wall_ms": self._reserve_wall_ms,
             "submit_wall_ms": self._submit_wall_ms,
@@ -149,17 +170,15 @@ class DVIStage2TelemetryHook:
             "capture_failed_count": self._capture_failed_count,
             "skipped_count": self._skipped_count,
         }
+        metrics.update(self.producer.handoff_metrics)
+        return metrics
 
 
 class DVIStage0TelemetryProbe:
-    """Stage-0 probe that captures boundary hidden states (minimal sync path).
+    """Stage-0 probe that captures boundary hidden states asynchronously.
 
     Mirrors :class:`DVIStage2TelemetryHook` on the first split stage: cheap
-    deterministic ``reserve`` per position, then a synchronous GPU→CPU
-    ``submit`` of the boundary hidden row.  The synchronous copy is the
-    baseline path; the production path replaces it with a pinned-memory +
-    CUDA-event handoff, shared in implementation with stage_2 but with an
-    independent bounded pool per worker.
+    deterministic reserve per position, then an independent bounded handoff.
     """
 
     def __init__(
@@ -197,7 +216,9 @@ class DVIStage0TelemetryProbe:
             self._skipped_count += 1
             return False
         t0 = time.perf_counter()
-        ok = self.producer.submit(ticket, hidden_row)
+        ok = self.producer.submit_device(ticket, hidden_row)
+        if not ok:
+            self.producer.cancel(ticket)
         self._submit_wall_ms += (time.perf_counter() - t0) * 1000.0
         if ok:
             self._reserved_count += 1
@@ -209,7 +230,7 @@ class DVIStage0TelemetryProbe:
 
     @property
     def metrics(self) -> dict[str, float | int]:
-        return {
+        metrics: dict[str, float | int] = {
             "enabled": self.enabled,
             "reserve_wall_ms": self._reserve_wall_ms,
             "submit_wall_ms": self._submit_wall_ms,
@@ -217,6 +238,8 @@ class DVIStage0TelemetryProbe:
             "submitted_count": self._submitted_count,
             "skipped_count": self._skipped_count,
         }
+        metrics.update(self.producer.handoff_metrics)
+        return metrics
 
 
 __all__ = [

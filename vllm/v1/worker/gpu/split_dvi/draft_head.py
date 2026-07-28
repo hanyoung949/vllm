@@ -14,10 +14,15 @@ a future trained delta can be hot-loaded without changing the module.
 
 Checkpoint (path A) is a single ``.safetensors`` / ``.pt`` file holding:
 
-    base_projection.weight  [vocab_size, hidden_size]   (required)
+    base_projection.weight  [vocab_size, hidden_size]   (embedded mode)
     norm.weight             [hidden_size]               (required iff rmsnorm)
     lora_A.weight           [rank, hidden_size]         (optional)
     lora_B.weight           [vocab_size, rank]          (optional, pair w/ A)
+
+Compact checkpoints explicitly omit ``base_projection.weight`` and declare
+``base_projection_source="target_model"`` plus its canonical SHA256 in the
+sidecar.  Runtime reloads that projection from the target model, verifies it,
+and clones it into an independent frozen parameter.
 
 plus an optional sidecar ``<name>.json`` with metadata
 ``{"norm": ..., "rank": ..., "alpha": ..., "vocab_size": ..., "hidden_size":
@@ -27,6 +32,7 @@ plus an optional sidecar ``<name>.json`` with metadata
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from dataclasses import dataclass
@@ -97,6 +103,13 @@ class DraftHeadMetadata:
     alpha: int
     vocab_size: int | None = None
     hidden_size: int | None = None
+    base_projection_source: str | None = None
+    base_projection_sha256: str | None = None
+
+
+def _sha256_tensor(tensor: torch.Tensor) -> str:
+    value = tensor.detach().to(dtype=torch.float32, device="cpu").contiguous()
+    return hashlib.sha256(value.numpy().tobytes()).hexdigest()
 
 
 def _load_state_and_metadata(
@@ -209,6 +222,8 @@ def load_draft_head_from_checkpoint(
     path: str,
     config: SplitDVIConfig,
     device: torch.device,
+    model: nn.Module | None = None,
+    model_config: object | None = None,
 ) -> SplitDVIDraftHead:
     """Path A: load an independent draft-head checkpoint."""
     state, raw_metadata = _load_state_and_metadata(path)
@@ -218,12 +233,41 @@ def load_draft_head_from_checkpoint(
         alpha=int(raw_metadata.get("alpha", config.draft_head_alpha)),
         vocab_size=raw_metadata.get("vocab_size"),
         hidden_size=raw_metadata.get("hidden_size"),
+        base_projection_source=raw_metadata.get("base_projection_source"),
+        base_projection_sha256=raw_metadata.get("base_projection_sha256"),
     )
     if config.draft_head_norm == "rmsnorm" and metadata.norm != "rmsnorm":
         raise ValueError(
             "Config requires rmsnorm but checkpoint metadata norm="
             f"{metadata.norm!r}"
         )
+    if "base_projection.weight" not in state:
+        if metadata.base_projection_source != "target_model":
+            raise ValueError(
+                "Draft head checkpoint is missing 'base_projection.weight'; "
+                "compact checkpoints must declare "
+                "base_projection_source='target_model'"
+            )
+        if not metadata.base_projection_sha256:
+            raise ValueError(
+                "Compact draft head metadata is missing "
+                "base_projection_sha256"
+            )
+        if model is None or model_config is None:
+            raise ValueError(
+                "Compact draft head requires the runtime target model to "
+                "reconstruct its base projection"
+            )
+        base_weight, source = _resolve_target_projection(model, model_config)
+        actual_hash = _sha256_tensor(base_weight)
+        if actual_hash != metadata.base_projection_sha256:
+            raise ValueError(
+                "Compact draft head base projection checksum mismatch: "
+                f"metadata {metadata.base_projection_sha256} vs target "
+                f"{actual_hash} ({source})"
+            )
+        state["base_projection.weight"] = base_weight
+
     dtype = _DTYPE_MAP[config.draft_head_dtype]
     head = _build_from_state(state, metadata, device, dtype)
     logger.info(
@@ -269,18 +313,11 @@ def _read_checkpoint_tensor(
     return None
 
 
-def init_draft_head_from_target_model(
-    config: SplitDVIConfig,
+def _resolve_target_projection(
     model: nn.Module,
     model_config: object,
-    device: torch.device,
-) -> SplitDVIDraftHead:
-    """Path B: initialize the frozen base projection from the target model's
-    ``lm_head`` (or tied ``embed_tokens``) weights.
-
-    ``model`` is the stage_0 partial model; with tied embeddings its
-    ``embed_tokens`` weight is exactly the ``lm_head`` weight.
-    """
+) -> tuple[torch.Tensor, str]:
+    """Resolve and clone the target LM projection used by the draft head."""
     hf_config = getattr(model_config, "hf_config", None)
     tie = bool(getattr(hf_config, "tie_word_embeddings", False))
     expected_vocab = getattr(hf_config, "vocab_size", None)
@@ -298,23 +335,39 @@ def init_draft_head_from_target_model(
             for name in ("lm_head.weight", "model.embed_tokens.weight"):
                 tensor = _read_checkpoint_tensor(model_path, name)
                 if tensor is not None:
-                    base_weight = tensor
+                    base_weight = tensor.detach().clone()
                     source = f"checkpoint:{name}"
                     break
     if base_weight is None:
         raise ValueError(
             "Cannot initialize the Stage-DVI draft head: no lm_head weight "
             "found (tied embeddings unavailable and checkpoint read failed). "
-            "Provide draft_head_path instead."
+            "Provide draft_head_path with an embedded base projection instead."
         )
-
     if base_weight.dim() != 2:
         raise ValueError(f"lm_head weight must be 2-D, got {base_weight.shape}")
-    vocab_size, hidden_size = base_weight.shape
+    vocab_size, _ = base_weight.shape
     if expected_vocab is not None and vocab_size < expected_vocab:
         raise ValueError(
             f"lm_head vocab {vocab_size} < tokenizer vocab {expected_vocab}"
         )
+    return base_weight, source
+
+
+def init_draft_head_from_target_model(
+    config: SplitDVIConfig,
+    model: nn.Module,
+    model_config: object,
+    device: torch.device,
+) -> SplitDVIDraftHead:
+    """Path B: initialize the frozen base projection from the target model's
+    ``lm_head`` (or tied ``embed_tokens``) weights.
+
+    ``model`` is the stage_0 partial model; with tied embeddings its
+    ``embed_tokens`` weight is exactly the ``lm_head`` weight.
+    """
+    base_weight, source = _resolve_target_projection(model, model_config)
+    _, hidden_size = base_weight.shape
 
     metadata = DraftHeadMetadata(
         norm=config.draft_head_norm,
@@ -350,6 +403,10 @@ def load_split_dvi_draft_head(
     """Entry point: independent checkpoint when given, else target lm_head."""
     if config.draft_head_path is not None:
         return load_draft_head_from_checkpoint(
-            config.draft_head_path, config, device
+            config.draft_head_path,
+            config,
+            device,
+            model=model,
+            model_config=model_config,
         )
     return init_draft_head_from_target_model(config, model, model_config, device)

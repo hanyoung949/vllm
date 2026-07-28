@@ -14,6 +14,7 @@ from safetensors.torch import save_file
 from vllm.config.split_dvi import SplitDVIConfig
 from vllm.v1.worker.gpu.split_dvi.draft_head import (
     SplitDVIDraftHead,
+    _sha256_tensor,
     load_draft_head_from_checkpoint,
     init_draft_head_from_target_model,
     load_split_dvi_draft_head,
@@ -227,3 +228,72 @@ def test_dtype_conversion(tmp_path):
     )
     assert head.base_projection.weight.dtype == torch.bfloat16
     assert head(torch.randn(2, HIDDEN, dtype=torch.bfloat16)).dtype == torch.bfloat16
+
+
+def _compact_metadata(weight: torch.Tensor) -> dict:
+    return {
+        "norm": "none",
+        "rank": RANK,
+        "alpha": ALPHA,
+        "vocab_size": VOCAB,
+        "hidden_size": HIDDEN,
+        "base_projection_source": "target_model",
+        "base_projection_sha256": _sha256_tensor(weight),
+    }
+
+
+def test_compact_checkpoint_reconstructs_independent_tied_projection(tmp_path):
+    torch.manual_seed(3)
+    target_weight = torch.randn(VOCAB, HIDDEN)
+    state = {
+        "lora_A.weight": torch.randn(RANK, HIDDEN),
+        "lora_B.weight": torch.randn(VOCAB, RANK),
+    }
+    path = _write_safetensors_checkpoint(
+        tmp_path, state, _compact_metadata(target_weight)
+    )
+    model = _FakeModel(target_weight)
+    model_config = _FakeModelConfig(tie=True, vocab_size=VOCAB, model_path=None)
+
+    head = load_split_dvi_draft_head(
+        _cfg(draft_head_path=path), model, model_config, DEVICE
+    )
+
+    assert torch.equal(head.base_projection.weight, target_weight)
+    assert head.base_projection.weight.data_ptr() != target_weight.data_ptr()
+    assert torch.equal(head.lora_a.weight, state["lora_A.weight"])
+    assert torch.equal(head.lora_b.weight, state["lora_B.weight"])
+
+
+def test_compact_checkpoint_rejects_target_projection_hash_mismatch(tmp_path):
+    target_weight = torch.randn(VOCAB, HIDDEN)
+    path = _write_safetensors_checkpoint(
+        tmp_path,
+        {
+            "lora_A.weight": torch.randn(RANK, HIDDEN),
+            "lora_B.weight": torch.randn(VOCAB, RANK),
+        },
+        _compact_metadata(target_weight),
+    )
+    model = _FakeModel(target_weight + 1)
+    model_config = _FakeModelConfig(tie=True, vocab_size=VOCAB, model_path=None)
+
+    with pytest.raises(ValueError, match="checksum mismatch"):
+        load_split_dvi_draft_head(
+            _cfg(draft_head_path=path), model, model_config, DEVICE
+        )
+
+
+def test_compact_checkpoint_requires_runtime_target_source(tmp_path):
+    target_weight = torch.randn(VOCAB, HIDDEN)
+    path = _write_safetensors_checkpoint(
+        tmp_path,
+        {
+            "lora_A.weight": torch.randn(RANK, HIDDEN),
+            "lora_B.weight": torch.randn(VOCAB, RANK),
+        },
+        _compact_metadata(target_weight),
+    )
+
+    with pytest.raises(ValueError, match="requires the runtime target model"):
+        load_draft_head_from_checkpoint(path, _cfg(), DEVICE)

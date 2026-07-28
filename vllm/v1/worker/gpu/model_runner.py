@@ -1298,42 +1298,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     hook.cancel(ticket)
             return
 
-        topk_ids_cpu = dvi_tensors.topk_ids.cpu()
-        topk_logprobs_cpu = dvi_tensors.topk_logprobs.cpu()
-        residual_mass_cpu = dvi_tensors.residual_mass.cpu()
-        top1_id_cpu = dvi_tensors.top1_id.cpu()
-        valid_count_cpu = dvi_tensors.valid_count.cpu()
-
         reserved_idx = 0
-        num_reserved = len(topk_ids_cpu)
+        num_reserved = dvi_tensors.topk_ids.shape[0]
         for ticket in dvi_tickets:
             if ticket is None:
                 continue
             if reserved_idx >= num_reserved:
                 hook.cancel(ticket)
                 continue
-            valid_count = int(valid_count_cpu[reserved_idx])
-            if valid_count == 0:
-                hook.cancel(ticket)
-                reserved_idx += 1
-                continue
-            verifier_topk_ids = topk_ids_cpu[reserved_idx, :valid_count].tolist()
-            verifier_topk_logprobs = topk_logprobs_cpu[
-                reserved_idx, :valid_count
-            ].tolist()
-            verifier_top1_id = int(top1_id_cpu[reserved_idx])
-            if verifier_top1_id not in verifier_topk_ids:
-                # Top-1 must be in the finite prefix; otherwise the record is
-                # invalid for the artifact schema.
-                hook.cancel(ticket)
-                reserved_idx += 1
-                continue
-            ok = hook.submit_processed_topk(
+            ok = hook.submit_device_topk(
                 ticket,
-                verifier_topk_ids=verifier_topk_ids,
-                verifier_topk_logprobs=verifier_topk_logprobs,
-                verifier_residual_mass=float(residual_mass_cpu[reserved_idx]),
-                verifier_top1_id=verifier_top1_id,
+                topk_ids=dvi_tensors.topk_ids[reserved_idx],
+                topk_logprobs=dvi_tensors.topk_logprobs[reserved_idx],
+                residual_mass=dvi_tensors.residual_mass[reserved_idx],
+                top1_id=dvi_tensors.top1_id[reserved_idx],
+                valid_count=dvi_tensors.valid_count[reserved_idx],
             )
             if not ok:
                 hook.cancel(ticket)
@@ -1643,7 +1622,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         input_batch: InputBatch,
         intermediate_tensors: IntermediateTensors,
     ) -> None:
-        """L0 stage_0 hidden capture (plain split path, minimal sync probe).
+        """L0 stage_0 hidden capture through the bounded async handoff.
 
         Captures the boundary hidden row for every sampled position using the
         same response-relative position formula as the stage_2 verifier
