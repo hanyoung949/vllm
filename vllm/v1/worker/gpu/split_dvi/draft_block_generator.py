@@ -28,6 +28,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
+import numpy as np
 import torch
 
 from vllm.config.compilation import CUDAGraphMode
@@ -39,9 +40,30 @@ from vllm.v1.worker.gpu.attn_utils import (
     build_slot_mappings_by_layer,
 )
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.v1.worker.gpu.split_dvi.draft_head import SplitDVIDraftHead
 
 logger = init_logger(__name__)
+
+
+def _activate_substep_loras(runner, input_batch: InputBatch, num_reqs: int) -> None:
+    """Match LoRA token mappings to each one-token draft sub-forward.
+
+    The main runner activates LoRAs for the scheduler's expanded speculative
+    batch (``k`` rows per request). The stage-0 draft loop replaces that
+    forward with ``k`` one-token-per-request forwards, so reusing the expanded
+    mapping gives the LoRA kernels a token count that does not match the
+    sub-forward. Rebuild the mapping for the actual substep shape.
+    """
+    if getattr(runner, "lora_config", None) is None:
+        return
+    one_token_per_req = np.ones(num_reqs, dtype=np.int32)
+    lora_inputs = runner.lora_state.make_lora_inputs(
+        list(input_batch.req_ids),
+        input_batch.idx_mapping_np[:num_reqs],
+        one_token_per_req,
+    )
+    runner._set_active_loras(*lora_inputs)
 
 
 @dataclass
@@ -54,6 +76,9 @@ class SplitDVIDraftBlock:
     draft_lengths: list[int]  # k per request
     draft_positions: list[int]  # flat, req-major position of each block row
     intermediate_tensors: IntermediateTensors
+    draft_support_offsets: list[int] | None = None
+    draft_support_token_ids: list[int] | None = None
+    draft_support_logits: list[float] | None = None
 
     @property
     def num_rows(self) -> int:
@@ -91,6 +116,7 @@ class SplitDVIDraftBlockGenerator:
         input_batch: InputBatch,
         num_draft_per_req: int,
         cycle_ids: list[int],
+        generation_ids: list[int] | None = None,
     ) -> SplitDVIDraftBlock:
         """Run the boundary + draft loop and return the block.
 
@@ -102,6 +128,8 @@ class SplitDVIDraftBlockGenerator:
         num_reqs = input_batch.num_reqs
         k = num_draft_per_req
         idx_mapping = input_batch.idx_mapping[:num_reqs]
+
+        _activate_substep_loras(runner, input_batch, num_reqs)
 
         req_states = runner.req_states
         # Committed-token frontier per request (position of the boundary row).
@@ -130,6 +158,31 @@ class SplitDVIDraftBlockGenerator:
         hidden_rows: list[torch.Tensor] = []
         residual_rows: list[torch.Tensor] = []
         draft_ids_rows: list[torch.Tensor] = []  # d_{j+1} per substep
+        support_ids_rows: list[torch.Tensor] = []
+        support_logits_rows: list[torch.Tensor] = []
+
+        runtime = getattr(runner, "split_dvi_runtime", None)
+        stochastic = runtime is not None and runtime.config.mode == "stochastic"
+        if stochastic:
+            if generation_ids is None:
+                raise ValueError("stochastic drafting requires generation_ids")
+            sampling = runtime.stochastic_sampling_for(list(input_batch.req_ids))
+            temperatures = torch.tensor(
+                [item.temperature for item in sampling],
+                dtype=torch.float32,
+                device=self.device,
+            )
+            proposal_seeds = torch.tensor(
+                [
+                    item.proposal_seed(generation_id)
+                    for item, generation_id in zip(sampling, generation_ids)
+                ],
+                dtype=torch.int64,
+                device=self.device,
+            )
+            batch_local_mapping = torch.arange(
+                num_reqs, dtype=torch.int32, device=self.device
+            )
 
         draft_start_ns = time.perf_counter_ns()
         ev_start = torch.cuda.Event(enable_timing=True)
@@ -195,10 +248,34 @@ class SplitDVIDraftBlockGenerator:
             hidden_rows.append(hidden_j)
             if "residual" in output.tensors:
                 residual_rows.append(output.tensors["residual"])
-            # Greedy draft proposal for position c+j+1.
-            draft_ids_rows.append(
-                self.draft_head.predict_token_ids(hidden_j).to(torch.int32)
-            )
+            if stochastic:
+                draft_logits = self.draft_head(hidden_j)
+                support_size = min(runtime.config.draft_top_k, draft_logits.shape[-1])
+                support_logits, support_ids = torch.topk(
+                    draft_logits, support_size, dim=-1
+                )
+                processed_support_logits = self.draft_head.process_support_logits(
+                    support_logits, temperatures
+                )
+                support_index = gumbel_sample(
+                    processed_support_logits,
+                    batch_local_mapping,
+                    temperatures,
+                    proposal_seeds,
+                    positions_j,
+                    apply_temperature=False,
+                )
+                proposal_ids = support_ids.gather(
+                    1, support_index.unsqueeze(1)
+                ).squeeze(1)
+                draft_ids_rows.append(proposal_ids.to(torch.int32))
+                support_ids_rows.append(support_ids.to(torch.int32))
+                support_logits_rows.append(processed_support_logits)
+            else:
+                # Greedy draft proposal for position c+j+1.
+                draft_ids_rows.append(
+                    self.draft_head.predict_token_ids(hidden_j).to(torch.int32)
+                )
         draft_ms = (time.perf_counter_ns() - draft_start_ns) / 1e6
         ev_end.record()
 
@@ -223,10 +300,27 @@ class SplitDVIDraftBlockGenerator:
         # Positions of each block row (req-major), for validation/telemetry.
         positions_block = positions_all.permute(1, 0).reshape(-1)
 
-        runtime = getattr(runner, "split_dvi_runtime", None)
         if runtime is not None and runtime.metrics is not None:
             runtime.metrics.draft_wall_ms += draft_ms
             runtime.metrics.record_draft_events(ev_start, ev_end)
+
+        support_offsets = None
+        support_token_ids = None
+        support_logits = None
+        if stochastic:
+            support_ids_block = (
+                torch.stack(support_ids_rows, dim=0).permute(1, 0, 2)
+            )
+            support_logits_block = (
+                torch.stack(support_logits_rows, dim=0).permute(1, 0, 2)
+            )
+            support_size = support_ids_block.shape[-1]
+            num_proposals = num_reqs * k
+            support_offsets = [
+                i * support_size for i in range(num_proposals + 1)
+            ]
+            support_token_ids = support_ids_block.reshape(-1).tolist()
+            support_logits = support_logits_block.reshape(-1).tolist()
 
         return SplitDVIDraftBlock(
             req_ids=list(input_batch.req_ids),
@@ -235,4 +329,7 @@ class SplitDVIDraftBlockGenerator:
             draft_lengths=[k] * num_reqs,
             draft_positions=positions_block.tolist(),
             intermediate_tensors=IntermediateTensors(block_tensors),
+            draft_support_offsets=support_offsets,
+            draft_support_token_ids=support_token_ids,
+            draft_support_logits=support_logits,
         )

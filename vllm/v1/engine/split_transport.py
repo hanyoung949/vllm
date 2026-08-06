@@ -16,6 +16,7 @@ Deferred:
 
 from __future__ import annotations
 
+import queue
 import threading
 import time
 from abc import ABC, abstractmethod
@@ -25,6 +26,7 @@ from typing import TYPE_CHECKING
 import torch
 import zmq
 
+from vllm import envs
 from vllm.v1.engine.split_data import SplitTensorPacket, SplitTokenPacket
 
 if TYPE_CHECKING:
@@ -117,6 +119,24 @@ class ZmqSplitActivationTransport(SplitActivationTransport):
         # for each DVI block tensor packet; wired by the model runner.
         self.dvi_metrics_sink = None
 
+        # Synthetic wire model for cross-machine deployment simulation.
+        # When enabled, every send hop is queued through a FIFO "wire" that
+        # serializes bandwidth occupancy (bytes / bps) and then applies a
+        # fixed one-way latency before the frames hit the socket.  Disabled
+        # by default (both knobs 0): sends take the original direct path.
+        self._wire_latency_s = (envs.VLLM_SPLIT_TRANSPORT_LATENCY_MS or 0.0) / 1e3
+        self._wire_bps = envs.VLLM_SPLIT_TRANSPORT_BPS or 0.0
+        self._wire_queue: queue.Queue | None = None
+        self._wire_thread: threading.Thread | None = None
+        if self._wire_latency_s > 0 or self._wire_bps > 0:
+            self._wire_queue = queue.Queue()
+            self._wire_thread = threading.Thread(
+                target=self._wire_worker,
+                name=f"split-wire-{stage_label}",
+                daemon=True,
+            )
+            self._wire_thread.start()
+
         # Tensor sockets.
         if endpoints.tensor_recv_addr:
             self._tensor_recv = self._context.socket(zmq.PULL)
@@ -134,6 +154,38 @@ class ZmqSplitActivationTransport(SplitActivationTransport):
             sock.connect(addr)
             self._token_sends.append(sock)
 
+    def _wire_send(self, send_fn, nbytes: int) -> None:
+        """Deliver frames directly, or through the synthetic wire if enabled."""
+        # getattr: bare test doubles constructed via __new__ lack wire attrs.
+        if getattr(self, "_wire_queue", None) is None:
+            with self._lock:
+                send_fn()
+            return
+        self._wire_queue.put((send_fn, nbytes))
+
+    def _wire_worker(self) -> None:
+        """FIFO wire: bandwidth serialization, then fixed one-way latency."""
+        wire_free = time.monotonic()
+        while True:
+            item = self._wire_queue.get()
+            try:
+                if item is None:  # shutdown sentinel from close()
+                    return
+                send_fn, nbytes = item
+                start = max(time.monotonic(), wire_free)
+                if self._wire_bps > 0:
+                    wire_free = start + nbytes / self._wire_bps
+                else:
+                    wire_free = start
+                deliver_at = wire_free + self._wire_latency_s
+                remaining = deliver_at - time.monotonic()
+                if remaining > 0:
+                    time.sleep(remaining)
+                with self._lock:
+                    send_fn()
+            finally:
+                self._wire_queue.task_done()
+
     def send_tensor_packet(self, packet: SplitTensorPacket) -> None:
         if self._tensor_send is None:
             raise RuntimeError(
@@ -141,13 +193,14 @@ class ZmqSplitActivationTransport(SplitActivationTransport):
             )
         t0 = time.perf_counter_ns()
         frames = packet.serialize()
+        nbytes = sum(len(f) for f in frames)
         if packet.is_dvi_block and self.dvi_metrics_sink is not None:
             self.dvi_metrics_sink(
                 (time.perf_counter_ns() - t0) / 1e6,
-                sum(len(f) for f in frames),
+                nbytes,
             )
-        with self._lock:
-            self._tensor_send.send_multipart(frames)
+        sock = self._tensor_send
+        self._wire_send(lambda: sock.send_multipart(frames), nbytes)
 
     def recv_tensor_packet(
         self, device: torch.device | str = "cpu"
@@ -165,9 +218,8 @@ class ZmqSplitActivationTransport(SplitActivationTransport):
                 f"Stage {self._stage_label} is not configured to send token packets."
             )
         data = packet.serialize()
-        with self._lock:
-            for sock in self._token_sends:
-                sock.send(data)
+        socks = list(self._token_sends)
+        self._wire_send(lambda: [s.send(data) for s in socks], len(data))
 
     def recv_token_packet(self) -> SplitTokenPacket:
         if self._token_recv is None:
@@ -183,6 +235,16 @@ class ZmqSplitActivationTransport(SplitActivationTransport):
         if getattr(self, "_closed", True):
             return
         self._closed = True
+        # Drain the synthetic wire before closing sockets so delayed frames
+        # still in flight are delivered (engine shutdown must not lose the
+        # final packets of a round).  The sentinel is FIFO-ordered after all
+        # pending items, so the thread exiting means the wire is drained.
+        wire_queue = getattr(self, "_wire_queue", None)
+        if wire_queue is not None:
+            wire_queue.put(None)
+            wire_thread = getattr(self, "_wire_thread", None)
+            if wire_thread is not None:
+                wire_thread.join(timeout=30)
         for sock in (
             getattr(self, "_tensor_recv", None),
             getattr(self, "_tensor_send", None),

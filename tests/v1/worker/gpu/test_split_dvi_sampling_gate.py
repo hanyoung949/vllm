@@ -27,7 +27,7 @@ from vllm.v1.worker.gpu.split_dvi.runtime import (
     check_sampling_params_supported,
 )
 
-MODEL = "/root/workspace/models/Qwen2.5-0.5B-Instruct"
+MODEL = "/workspace/models/Qwen3-4B"
 
 
 # ----------------------------------------------------------------------
@@ -106,6 +106,50 @@ def test_min_tokens_rejected():
     assert reason is not None and "min_tokens" in reason
 
 
+def test_plain_stochastic_grpo_sampling_allowed():
+    sp = SamplingParams(
+        temperature=0.7,
+        top_p=0.95,
+        top_k=32,
+        logprobs=1,
+    )
+    assert check_sampling_params_supported(sp, mode="stochastic") is None
+
+
+@pytest.mark.parametrize(
+    "kwargs, match",
+    [
+        (dict(temperature=0.0), "temperature"),
+        (dict(temperature=0.7, min_p=0.1), "min_p"),
+        (dict(temperature=0.7, presence_penalty=0.1), "presence_penalty"),
+    ],
+)
+def test_stochastic_mode_stays_fail_closed(kwargs, match):
+    reason = check_sampling_params_supported(
+        SamplingParams(**kwargs), mode="stochastic"
+    )
+    assert reason is not None and match in reason
+
+
+def test_stochastic_config_requires_bonus_and_bounded_draft_support():
+    with pytest.raises(ValueError, match="bonus_token"):
+        SplitDVIConfig(enabled=True, mode="stochastic")
+    with pytest.raises(ValueError, match="draft_top_k"):
+        SplitDVIConfig(
+            enabled=True,
+            mode="stochastic",
+            bonus_token=True,
+            draft_top_k=0,
+        )
+    cfg = SplitDVIConfig(
+        enabled=True,
+        mode="stochastic",
+        bonus_token=True,
+        draft_top_k=16,
+    )
+    assert cfg.num_scheduler_spec_tokens == cfg.draft_length - 1
+
+
 # ----------------------------------------------------------------------
 # KV connector fail-fast
 # ----------------------------------------------------------------------
@@ -151,22 +195,27 @@ def test_config_without_kv_connector_ok():
 
 
 def test_hybrid_linear_attention_rejected():
-    from vllm.engine.arg_utils import EngineArgs
+    from unittest import mock
 
     with pytest.raises(ValueError, match="hybrid/linear-attention"):
-        EngineArgs(
-            model="/root/workspace/models/Qwen3.5-2B",
-            enforce_eager=True,
-            max_model_len=64,
-            gpu_memory_utilization=0.3,
-            tensor_parallel_size=1,
-            pipeline_parallel_size=3,
-            enable_layerwise_split=True,
-            split_stage_0_size=2,
-            split_stage_2_size=2,
-            split_stage_1_tensor_parallel_size=1,
-            split_dvi_config={"enabled": True, "draft_length": 4},
-        ).create_engine_config()
+        SplitDVIConfig(enabled=True).validate_against_vllm_config(
+            mock.Mock(
+                parallel_config=mock.Mock(
+                    enable_layerwise_split=True,
+                    pipeline_parallel_size=3,
+                ),
+                speculative_config=None,
+                model_config=mock.Mock(
+                    is_moe=False,
+                    has_inner_state=False,
+                    is_attention_free=False,
+                    hf_config=mock.Mock(
+                        text_config=None,
+                        layer_types=["linear_attention", "full_attention"],
+                    ),
+                ),
+            )
+        )
 
 
 class TestRecurrentStateGate:

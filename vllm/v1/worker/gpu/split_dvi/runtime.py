@@ -25,6 +25,7 @@ Step kinds (all stages classify identically from the same SchedulerOutput):
 from __future__ import annotations
 
 import enum
+import hashlib
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -69,8 +70,10 @@ def _is_warmup_req(req_id: str) -> bool:
     return req_id.startswith(_WARMUP_REQ_PREFIX)
 
 
-def check_sampling_params_supported(sp: "SamplingParams") -> str | None:
-    """Return a violation reason if the request is not plain greedy, else None.
+def check_sampling_params_supported(
+    sp: "SamplingParams", mode: str = "greedy"
+) -> str | None:
+    """Return a violation reason for the selected DVI sampling mode.
 
     The verifier bypasses the sampler entirely, so anything that would alter
     the distribution or output shape must be rejected up front to keep DVI
@@ -79,19 +82,28 @@ def check_sampling_params_supported(sp: "SamplingParams") -> str | None:
     argmax cannot honor.
     """
     if sp is None:
-        return "missing sampling params (greedy required)"
-    if getattr(sp, "temperature", 1.0) != 0.0:
-        return f"temperature={getattr(sp, 'temperature', None)} != 0"
-    if getattr(sp, "top_p", 1.0) != 1.0:
-        return "top_p != 1.0"
-    top_k = getattr(sp, "top_k", 0)
-    if top_k not in (0, -1, 1):
-        return f"top_k={top_k} unsupported"
+        return "missing sampling params"
+    temperature = getattr(sp, "temperature", 1.0)
+    if mode == "greedy":
+        if temperature != 0.0:
+            return f"temperature={temperature} != 0"
+        if getattr(sp, "top_p", 1.0) != 1.0:
+            return "top_p != 1.0"
+        top_k = getattr(sp, "top_k", 0)
+        if top_k not in (0, -1, 1):
+            return f"top_k={top_k} unsupported"
+    elif mode == "stochastic":
+        if temperature <= 0.0:
+            return f"temperature={temperature} must be > 0"
+        if getattr(sp, "min_p", 0.0) != 0.0:
+            return "min_p != 0"
+    else:
+        return f"unknown DVI mode {mode!r}"
     if getattr(sp, "n", 1) != 1:
         return "n != 1"
     if getattr(sp, "use_beam_search", False):
         return "beam search"
-    if getattr(sp, "logprobs", None) is not None:
+    if mode == "greedy" and getattr(sp, "logprobs", None) is not None:
         return "logprobs requested"
     if getattr(sp, "prompt_logprobs", None) is not None:
         return "prompt_logprobs requested"
@@ -126,6 +138,25 @@ class DVIBlockResult:
     draft_version: str | None
 
 
+@dataclass(frozen=True)
+class DVIStochasticSampling:
+    temperature: float
+    seed: int
+
+    def proposal_seed(self, generation_id: int) -> int:
+        value = (
+            (self.seed & ((1 << 64) - 1))
+            ^ 0xD1B54A32D192ED03
+            ^ ((generation_id * 0x9E3779B97F4A7C15) & ((1 << 64) - 1))
+        )
+        return value - (1 << 64) if value >= (1 << 63) else value
+
+
+def _default_request_seed(req_id: str) -> int:
+    digest = hashlib.sha256(req_id.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], byteorder="little", signed=True)
+
+
 class SplitDVIRuntime:
     def __init__(self, runner: "GPUModelRunner", config: SplitDVIConfig):
         self.runner = runner
@@ -156,6 +187,7 @@ class SplitDVIRuntime:
         # these become real hashes once hot updates / draft training land.
         self.policy_version: str | None = None
         self.draft_version: str | None = None
+        self._stochastic_sampling: dict[str, DVIStochasticSampling] = {}
 
     # ------------------------------------------------------------------
     # request lifecycle
@@ -167,7 +199,9 @@ class SplitDVIRuntime:
         generation_id: int = 0,
     ) -> None:
         if not _is_warmup_req(req_id):
-            violation = check_sampling_params_supported(sampling_params)
+            violation = check_sampling_params_supported(
+                sampling_params, self.config.mode
+            )
             if violation is not None:
                 # v1 fail-fast: unsupported sampling would silently diverge
                 # from the greedy baseline, so reject at admission.  This is
@@ -176,12 +210,29 @@ class SplitDVIRuntime:
                 # cross-stage desync via SplitDVIProtocolError).
                 raise ValueError(
                     f"SplitDVI unsupported sampling for request {req_id!r}: "
-                    f"{violation}. Greedy-only (temperature=0) in v1."
+                    f"{violation}. mode={self.config.mode!r}."
+                )
+            if self.config.mode == "stochastic":
+                seed = getattr(sampling_params, "seed", None)
+                self._stochastic_sampling[req_id] = DVIStochasticSampling(
+                    temperature=float(sampling_params.temperature),
+                    seed=_default_request_seed(req_id) if seed is None else int(seed),
                 )
         self.tracker.on_request_added(req_id, generation_id)
 
     def on_request_removed(self, req_id: str) -> None:
+        self._stochastic_sampling.pop(req_id, None)
         self.tracker.on_request_removed(req_id)
+
+    def stochastic_sampling_for(
+        self, req_ids: list[str]
+    ) -> list[DVIStochasticSampling]:
+        try:
+            return [self._stochastic_sampling[req_id] for req_id in req_ids]
+        except KeyError as exc:
+            raise SplitDVIProtocolError(
+                f"Missing stochastic sampling state for request {exc.args[0]!r}"
+            ) from exc
 
     # ------------------------------------------------------------------
     # draft head (stage_0): loaded with the model so its memory is accounted
@@ -246,24 +297,32 @@ class SplitDVIRuntime:
         self.on_model_loaded()
         k = self.runner.num_speculative_steps + 1
         cycle_ids = self.tracker.cycle_ids_for(list(input_batch.req_ids))
+        generation_ids = self.tracker.generation_ids_for(
+            list(input_batch.req_ids)
+        )
         if self.metrics is not None:
             # cycle wall clock starts here (host monotonic, stage_0 only);
             # it ends when the answering token packet arrives back at this
             # rank (see validate_token_packet).  Keyed by (req_ids,
             # cycle_ids) so concurrent blocks can't overwrite each other.
             self.metrics.cycle_start(list(input_batch.req_ids), cycle_ids)
-        block = self._generator.generate(input_batch, k, cycle_ids)
+        block = self._generator.generate(
+            input_batch, k, cycle_ids, generation_ids
+        )
         self._outgoing_metadata = {
             "packet_kind": "dvi_block",
+            "is_fallback": False,
             "cycle_ids": block.cycle_ids,
             "draft_token_ids": block.draft_token_ids,
             "draft_lengths": block.draft_lengths,
-            "generation_ids": self.tracker.generation_ids_for(
-                list(input_batch.req_ids)
-            ),
+            "generation_ids": generation_ids,
             "draft_positions": block.draft_positions,
             "policy_version": self.policy_version,
             "draft_version": self.draft_version,
+            "sampling_mode": self.config.mode,
+            "draft_support_offsets": block.draft_support_offsets,
+            "draft_support_token_ids": block.draft_support_token_ids,
+            "draft_support_logits": block.draft_support_logits,
         }
         return block.intermediate_tensors
 
@@ -286,6 +345,7 @@ class SplitDVIRuntime:
                 draft_positions.extend(base + j for j in range(draft_lengths[i]))
         self._outgoing_metadata = {
             "packet_kind": "dvi_block",
+            "is_fallback": True,
             "cycle_ids": self.tracker.cycle_ids_for(list(input_batch.req_ids)),
             "draft_token_ids": [0] * sum(draft_lengths),
             "draft_lengths": draft_lengths,
@@ -295,6 +355,22 @@ class SplitDVIRuntime:
             "draft_positions": draft_positions,
             "policy_version": self.policy_version,
             "draft_version": self.draft_version,
+            "sampling_mode": self.config.mode,
+            "draft_support_offsets": (
+                list(range(sum(draft_lengths) + 1))
+                if self.config.mode == "stochastic"
+                else None
+            ),
+            "draft_support_token_ids": (
+                [0] * sum(draft_lengths)
+                if self.config.mode == "stochastic"
+                else None
+            ),
+            "draft_support_logits": (
+                [0.0] * sum(draft_lengths)
+                if self.config.mode == "stochastic"
+                else None
+            ),
         }
         if self.metrics is not None and not getattr(
             self.runner, "in_warmup", False
@@ -354,6 +430,12 @@ class SplitDVIRuntime:
         )
         if "draft_positions" not in dvi:
             raise SplitDVIProtocolError("DVI block metadata missing draft_positions")
+        packet_mode = dvi.get("sampling_mode") or "greedy"
+        if packet_mode != self.config.mode:
+            raise SplitDVIProtocolError(
+                f"DVI sampling mode {packet_mode!r} != local mode "
+                f"{self.config.mode!r}"
+            )
         draft_lengths = dvi.get("draft_lengths")
         draft_token_ids = dvi.get("draft_token_ids")
         num_draft_per_req = input_batch.num_draft_tokens_per_req
@@ -381,6 +463,23 @@ class SplitDVIRuntime:
                 f"DVI draft_token_ids length {len(draft_token_ids)} != "
                 f"sum(draft_lengths) {sum(draft_lengths)}"
             )
+        if self.config.mode == "stochastic":
+            support_offsets = dvi.get("draft_support_offsets")
+            support_ids = dvi.get("draft_support_token_ids")
+            support_logits = dvi.get("draft_support_logits")
+            if (
+                support_offsets is None
+                or support_ids is None
+                or support_logits is None
+            ):
+                raise SplitDVIProtocolError(
+                    "Stochastic DVI metadata missing draft support fields"
+                )
+            if len(support_offsets) != len(draft_token_ids) + 1:
+                raise SplitDVIProtocolError(
+                    "Stochastic DVI support offset count does not match "
+                    "draft token count"
+                )
         if self.config.validate_stage_state:
             num_scheduled = metadata.get("num_scheduled_tokens")
             if num_scheduled is not None and (
@@ -402,6 +501,12 @@ class SplitDVIRuntime:
     # ------------------------------------------------------------------
     # gpu_worker metadata handoff
     # ------------------------------------------------------------------
+    def peek_outgoing_metadata(self) -> dict[str, Any] | None:
+        """Inspect the next outgoing packet metadata without consuming it."""
+        if self.is_first_stage:
+            return self._outgoing_metadata
+        return self._incoming_metadata
+
     def outgoing_metadata(self) -> dict[str, Any] | None:
         """Metadata for the worker's next outgoing tensor packet.
 
@@ -453,6 +558,11 @@ class SplitDVIRuntime:
         logits = self.runner.model.compute_logits(sample_hidden_states)
 
         metadata = self._incoming_metadata
+        if self.config.mode == "stochastic":
+            return self._verify_stochastic_block(
+                logits, input_batch, metadata
+            )
+
         result: SplitDVIVerificationResult = self._verifier.verify(
             logits,
             req_ids=list(input_batch.req_ids),
@@ -494,6 +604,448 @@ class SplitDVIRuntime:
             num_rejected=num_rejected,
             cycle_ids=metadata["cycle_ids"],
             accepted_counts=result.accepted_counts,
+            generation_ids=metadata["generation_ids"],
+            policy_version=metadata.get("policy_version"),
+            draft_version=metadata.get("draft_version"),
+        )
+
+    def _capture_stochastic_stage2_first_rows(
+        self,
+        processed_logits: torch.Tensor,
+        input_batch: "InputBatch",
+        metadata: dict[str, Any],
+        proposal_counts: list[int],
+        cu_num_logits: list[int],
+    ) -> None:
+        """Capture the committed-path first target row of each DVI block."""
+        hook = self.runner.dvi_telemetry_hook
+        if hook is None or not hook.enabled or hook.evaluation_mode or metadata.get("is_fallback", False):
+            return
+
+        draft_positions = metadata["draft_positions"]
+        draft_lengths = metadata["draft_lengths"]
+        prefill_len = input_batch.prefill_len_np
+        draft_offset = 0
+        for req_idx, (draft_len, proposal_count) in enumerate(
+            zip(draft_lengths, proposal_counts)
+        ):
+            if proposal_count <= 0:
+                draft_offset += draft_len
+                continue
+            response_pos = (
+                int(draft_positions[draft_offset])
+                + 1
+                - int(prefill_len[req_idx])
+            )
+            draft_offset += draft_len
+            if response_pos < 0:
+                continue
+
+            key = hook.make_record_key(
+                input_batch.req_ids[req_idx], response_pos
+            )
+            ticket = hook.reserve(key)
+            if ticket is None:
+                continue
+
+            row = processed_logits[cu_num_logits[req_idx]].to(torch.float32)
+            top_k = min(hook.dvi_top_k, row.shape[-1])
+            topk_values, topk_ids = torch.topk(row, k=top_k, dim=-1)
+            log_probs = torch.log_softmax(row, dim=-1)
+            topk_logprobs = log_probs.gather(0, topk_ids)
+            valid_count = torch.isfinite(topk_values).sum(dtype=torch.int32)
+            residual_mass = (
+                1.0 - topk_logprobs.exp().sum()
+            ).clamp(0.0, 1.0)
+            top1_id = row.argmax(dim=-1)
+            ok = hook.submit_device_topk(
+                ticket,
+                topk_ids=topk_ids.to(torch.int32),
+                topk_logprobs=topk_logprobs,
+                residual_mass=residual_mass,
+                top1_id=top1_id.to(torch.int32),
+                valid_count=valid_count,
+            )
+            if not ok:
+                hook.cancel(ticket)
+
+    def _capture_stochastic_evaluation_rows(
+        self,
+        processed_logits: torch.Tensor,
+        input_batch: "InputBatch",
+        metadata: dict[str, Any],
+        proposal_counts: list[int],
+        cu_num_logits: list[int],
+        sampled: torch.Tensor,
+        raw_num_sampled: torch.Tensor,
+        expected_first_acceptances: list[float | None],
+        first_coverages: list[float | None],
+        request_seeds: list[int],
+    ) -> None:
+        """Capture every target row and realized cycle decision for v2."""
+        hook = self.runner.dvi_telemetry_hook
+        if (
+            hook is None
+            or not hook.enabled
+            or not hook.evaluation_mode
+            or metadata.get("is_fallback", False)
+        ):
+            return
+
+        draft_positions = metadata["draft_positions"]
+        draft_lengths = metadata["draft_lengths"]
+        support_offsets = metadata["draft_support_offsets"]
+        support_ids = metadata["draft_support_token_ids"]
+        support_logits = metadata["draft_support_logits"]
+        prefill_len = input_batch.prefill_len_np
+        records: list[dict[str, Any]] = []
+        draft_offset = 0
+        cu = list(cu_num_logits)
+        for req_idx, (draft_len, proposal_count) in enumerate(
+            zip(draft_lengths, proposal_counts)
+        ):
+            row_count = cu[req_idx + 1] - cu[req_idx]
+            sample_count = int(raw_num_sampled[req_idx])
+            committed = sampled[req_idx, :sample_count].tolist()
+            accepted_count = int(raw_num_sampled[req_idx]) - 1
+            accepted_count = max(0, min(accepted_count, proposal_count))
+            expected_row_count = proposal_count + 1
+            if row_count != expected_row_count:
+                raise SplitDVIProtocolError(
+                    "evaluation capture row count does not match the runtime "
+                    f"proposal/bonus contract: rows={row_count}, "
+                    f"expected={expected_row_count}, proposals={proposal_count}"
+                )
+            correction_token_id = (
+                int(committed[-1])
+                if accepted_count < proposal_count and committed
+                else None
+            )
+            for row_index in range(expected_row_count):
+                row = processed_logits[cu[req_idx] + row_index].to(torch.float32)
+                top_k = min(hook.dvi_top_k, row.shape[-1])
+                topk_values, topk_ids = torch.topk(row, k=top_k, dim=-1)
+                log_probs = torch.log_softmax(row, dim=-1)
+                topk_logprobs = log_probs.gather(0, topk_ids)
+                valid_count = int(torch.isfinite(topk_values).sum())
+                topk_ids_list = topk_ids[:valid_count].tolist()
+                topk_logprobs_list = topk_logprobs[:valid_count].tolist()
+                residual_mass = max(
+                    0.0, 1.0 - sum(float(value.exp()) for value in topk_logprobs[:valid_count])
+                )
+                support_row_ids: list[int] = []
+                if row_index < proposal_count:
+                    support_start = int(
+                        support_offsets[draft_offset + row_index]
+                    )
+                    support_end = int(
+                        support_offsets[draft_offset + row_index + 1]
+                    )
+                    support_row_ids = [
+                        int(value)
+                        for value in support_ids[support_start:support_end]
+                    ]
+                teacher_support_probs = (
+                    torch.softmax(row, dim=-1)[
+                        torch.as_tensor(
+                            support_row_ids,
+                            dtype=torch.long,
+                            device=row.device,
+                        )
+                    ].tolist()
+                    if support_row_ids
+                    else []
+                )
+                if row_index < accepted_count:
+                    accepted: bool | None = True
+                elif row_index == accepted_count and row_index < proposal_count:
+                    accepted = False
+                else:
+                    accepted = None
+                record: dict[str, Any] = {
+                    "request_id": input_batch.req_ids[req_idx],
+                    "cycle_id": int(metadata["cycle_ids"][req_idx]),
+                    "generation_id": int(metadata["generation_ids"][req_idx]),
+                    "row_index": row_index,
+                    "absolute_position": (
+                        int(draft_positions[draft_offset + row_index])
+                        + 1
+                        - int(prefill_len[req_idx])
+                    ),
+                    "rng_position": int(
+                        draft_positions[draft_offset + row_index]
+                    ),
+                    "request_seed": int(request_seeds[req_idx]),
+                    "row_kind": (
+                        "proposal" if row_index < proposal_count else "bonus"
+                    ),
+                    "num_proposals": proposal_count,
+                    "verifier_topk_ids": topk_ids_list,
+                    "verifier_topk_logprobs": [
+                        float(value) for value in topk_logprobs_list
+                    ],
+                    "verifier_residual_mass": residual_mass,
+                    "teacher_probs_on_draft_support": [
+                        float(value) for value in teacher_support_probs
+                    ],
+                    "accepted": accepted,
+                    "accepted_count": accepted_count,
+                    "committed_token_ids": (
+                        [int(value) for value in committed]
+                        if row_index == 0
+                        else []
+                    ),
+                    "correction_token_id": (
+                        correction_token_id if row_index == 0 else None
+                    ),
+                    "terminal_token_id": (
+                        int(committed[-1]) if committed and row_index == 0 else None
+                    ),
+                    "advancement": sample_count if row_index == 0 else 0,
+                    "expected_first_acceptance": (
+                        expected_first_acceptances[req_idx]
+                        if row_index == 0 else None
+                    ),
+                    "coverage": (
+                        first_coverages[req_idx] if row_index == 0 else None
+                    ),
+                }
+                records.append(record)
+            draft_offset += int(draft_len)
+        hook.capture_evaluation_rows(records)
+
+    def _verify_stochastic_block(
+        self,
+        logits: torch.Tensor,
+        input_batch: "InputBatch",
+        metadata: dict[str, Any],
+    ) -> DVIBlockResult:
+        from vllm.v1.worker.gpu.sample.output import SamplerOutput
+        from vllm.v1.worker.gpu.spec_decode.rejection_sampler_utils import (
+            rejection_sample,
+        )
+
+        assert self.runner.sampler is not None
+        assert self.runner.rejection_sampler is not None
+        num_reqs = input_batch.num_reqs
+        num_speculative_steps = self.runner.num_speculative_steps
+        vocab_size = logits.shape[-1]
+        device = logits.device
+
+        draft_sampled = torch.zeros(
+            logits.shape[0],
+            dtype=input_batch.input_ids.dtype,
+            device=device,
+        )
+        draft_logits = torch.full(
+            (num_reqs, num_speculative_steps, vocab_size),
+            -torch.inf,
+            dtype=torch.float32,
+            device=device,
+        )
+        support_offsets = metadata["draft_support_offsets"]
+        support_ids = metadata["draft_support_token_ids"]
+        support_logits = metadata["draft_support_logits"]
+        draft_token_ids = metadata["draft_token_ids"]
+        draft_lengths = metadata["draft_lengths"]
+
+        proposal_offset = 0
+        proposal_counts: list[int] = []
+        cu_num_logits = input_batch.cu_num_logits_np.tolist()
+        for req_idx, draft_len in enumerate(draft_lengths):
+            row_start = cu_num_logits[req_idx]
+            row_end = cu_num_logits[req_idx + 1]
+            num_logits = row_end - row_start
+            num_proposals = min(
+                num_speculative_steps,
+                draft_len,
+                max(0, num_logits - 1),
+            )
+            proposal_counts.append(num_proposals)
+            for local_pos in range(num_proposals):
+                proposal_idx = proposal_offset + local_pos
+                proposal = draft_token_ids[proposal_idx]
+                support_start = support_offsets[proposal_idx]
+                support_end = support_offsets[proposal_idx + 1]
+                ids = torch.tensor(
+                    support_ids[support_start:support_end],
+                    dtype=torch.int64,
+                    device=device,
+                )
+                values = torch.tensor(
+                    support_logits[support_start:support_end],
+                    dtype=torch.float32,
+                    device=device,
+                )
+                if not bool((ids == proposal).any()):
+                    raise SplitDVIProtocolError(
+                        f"Stochastic proposal {proposal} is absent from its "
+                        "draft support"
+                    )
+                draft_logits[req_idx, local_pos, ids] = values
+                draft_sampled[row_start + local_pos + 1] = proposal
+            proposal_offset += draft_len
+
+        pos = torch.tensor(
+            metadata["draft_positions"], dtype=torch.int64, device=device
+        )
+        processed_logits = self.runner.sampler.apply_sampling_params(
+            logits,
+            input_batch.expanded_idx_mapping,
+            input_batch.idx_mapping_np,
+            pos,
+            draft_sampled,
+            input_batch.expanded_local_pos,
+        )
+        self._capture_stochastic_stage2_first_rows(
+            processed_logits,
+            input_batch,
+            metadata,
+            proposal_counts,
+            cu_num_logits,
+        )
+
+        expected_first_acceptances: list[float | None] = [None] * num_reqs
+        first_coverages: list[float | None] = [None] * num_reqs
+        first_distribution_diagnostics: list[
+            tuple[bool, bool, float, float] | None
+        ] = [None] * num_reqs
+        valid_req_indices = [
+            req_idx
+            for req_idx, count in enumerate(proposal_counts)
+            if count > 0
+        ]
+        if valid_req_indices:
+            request_indices = torch.tensor(
+                valid_req_indices, dtype=torch.int64, device=device
+            )
+            first_target_rows = torch.tensor(
+                [cu_num_logits[index] for index in valid_req_indices],
+                dtype=torch.int64,
+                device=device,
+            )
+            target_first = processed_logits[first_target_rows].to(torch.float32)
+            draft_first = draft_logits[request_indices, 0].to(torch.float32)
+            target_probs = torch.softmax(target_first, dim=-1)
+            draft_probs = torch.softmax(draft_first, dim=-1)
+            overlaps = torch.minimum(target_probs, draft_probs).sum(dim=-1)
+            target_top1_probs, target_top1_ids = target_probs.max(dim=-1)
+            draft_top1_probs, draft_top1_ids = draft_probs.max(dim=-1)
+            target_top1_in_support = torch.isfinite(
+                draft_first.gather(1, target_top1_ids.unsqueeze(1)).squeeze(1)
+            )
+            top1_matches = draft_top1_ids == target_top1_ids
+            coverage_top_k = min(
+                self.runner.dvi_top_k,
+                target_first.shape[-1],
+            )
+            target_support_ids = torch.topk(
+                target_first, k=coverage_top_k, dim=-1
+            ).indices
+            coverages = draft_probs.gather(1, target_support_ids).sum(dim=-1)
+            diagnostics = zip(
+                target_top1_in_support.tolist(),
+                top1_matches.tolist(),
+                target_top1_probs.tolist(),
+                draft_top1_probs.tolist(),
+            )
+            for req_idx, overlap, coverage, diagnostic in zip(
+                valid_req_indices,
+                overlaps.tolist(),
+                coverages.tolist(),
+                diagnostics,
+            ):
+                expected_first_acceptances[req_idx] = overlap
+                first_coverages[req_idx] = coverage
+                first_distribution_diagnostics[req_idx] = diagnostic
+
+        logits_per_req = torch.diff(input_batch.cu_num_logits)
+        local_idx_mapping = torch.arange(
+            num_reqs, dtype=torch.int32, device=device
+        )
+        local_expanded_idx_mapping = torch.repeat_interleave(
+            local_idx_mapping, logits_per_req
+        )
+        stochastic_temperature = torch.ones(
+            num_reqs, dtype=torch.float32, device=device
+        )
+        seeds = self.runner.sampler.sampling_states.seeds.gpu[
+            input_batch.idx_mapping
+        ].contiguous()
+        sampled, raw_num_sampled = rejection_sample(
+            target_logits=processed_logits,
+            draft_logits=draft_logits,
+            draft_sampled=draft_sampled,
+            cu_num_logits=input_batch.cu_num_logits,
+            pos=pos,
+            idx_mapping=local_idx_mapping,
+            expanded_idx_mapping=local_expanded_idx_mapping,
+            expanded_local_pos=input_batch.expanded_local_pos,
+            temperature=stochastic_temperature,
+            seed=seeds,
+            num_speculative_steps=num_speculative_steps,
+            use_fp64=self.runner.sampler.use_fp64_gumbel,
+        )
+        logprob_logits = (
+            processed_logits
+            if self.runner.sampler.logprobs_mode == "processed_logprobs"
+            else logits
+        )
+        logprobs_tensors = self.runner.rejection_sampler._get_logprobs_tensors(
+            input_batch,
+            sampled,
+            raw_num_sampled,
+            logprob_logits,
+        )
+        accepted_counts = (
+            (raw_num_sampled - 1)
+            .clamp(min=0, max=num_speculative_steps)
+            .tolist()
+        )
+        raw_num_sampled_list = raw_num_sampled.tolist()
+        num_sampled, num_rejected = get_num_sampled_and_rejected(
+            raw_num_sampled,
+            input_batch.seq_lens,
+            input_batch.cu_num_logits,
+            input_batch.idx_mapping,
+            self.runner.req_states.prefill_len.gpu,
+        )
+        self._capture_stochastic_evaluation_rows(
+            processed_logits,
+            input_batch,
+            metadata,
+            proposal_counts,
+            cu_num_logits,
+            sampled,
+            raw_num_sampled,
+            expected_first_acceptances,
+            first_coverages,
+            seeds.tolist(),
+        )
+        sampler_output = SamplerOutput(
+            sampled_token_ids=sampled,
+            logprobs_tensors=logprobs_tensors,
+            num_nans=None,
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
+        )
+        if self.metrics is not None and not getattr(
+            self.runner, "in_warmup", False
+        ):
+            self.metrics.record_verification(
+                draft_lengths,
+                accepted_counts,
+                raw_num_sampled_list,
+                proposal_counts,
+                expected_first_acceptances,
+                first_distribution_diagnostics,
+            )
+        return DVIBlockResult(
+            sampler_output=sampler_output,
+            num_sampled=num_sampled,
+            num_rejected=num_rejected,
+            cycle_ids=metadata["cycle_ids"],
+            accepted_counts=accepted_counts,
             generation_ids=metadata["generation_ids"],
             policy_version=metadata.get("policy_version"),
             draft_version=metadata.get("draft_version"),
@@ -600,3 +1152,7 @@ class SplitDVIRuntime:
                 stage=self.metrics.stage,
                 log_interval_cycles=self.metrics.log_interval_cycles,
             )
+
+    def metrics_snapshot(self) -> dict | None:
+        """Return structured counters for benchmark/evaluation RPC callers."""
+        return self.metrics.snapshot() if self.metrics is not None else None

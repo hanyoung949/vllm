@@ -204,3 +204,98 @@ def test_dvi_block_send_reports_serialize_metrics():
     sink2 = mock.Mock()
     _bare_transport(sink2).send_tensor_packet(normal)
     sink2.assert_not_called()
+
+
+def test_wire_model_disabled_by_default():
+    """Without the env knobs the wire model is fully bypassed."""
+    t = ZmqSplitActivationTransport(
+        SplitTransportEndpoints(), stage_label="stage_0"
+    )
+    try:
+        assert t._wire_queue is None
+        assert t._wire_thread is None
+        assert t._wire_latency_s == 0.0
+        assert t._wire_bps == 0.0
+    finally:
+        t.close()
+
+
+def _make_wire_pair(monkeypatch, latency_ms: str, bps: str, port: int):
+    """One-hop sender/receiver pair with the wire model configured."""
+    monkeypatch.setenv("VLLM_SPLIT_TRANSPORT_LATENCY_MS", latency_ms)
+    monkeypatch.setenv("VLLM_SPLIT_TRANSPORT_BPS", bps)
+    sender = ZmqSplitActivationTransport(
+        SplitTransportEndpoints(tensor_send_addr=f"tcp://127.0.0.1:{port}"),
+        stage_label="stage_0",
+    )
+    receiver = ZmqSplitActivationTransport(
+        SplitTransportEndpoints(tensor_recv_addr=f"tcp://127.0.0.1:{port}"),
+        stage_label="stage_1",
+    )
+    time.sleep(0.2)  # Allow ZMQ sockets to connect.
+    return sender, receiver
+
+
+def _tensor_packet(req_id: str, value: float, n: int = 2048):
+    return SplitTensorPacket(
+        req_ids=[req_id],
+        num_scheduled_tokens=[1],
+        is_prompt=False,
+        tensors={
+            "hidden_states": torch.full((1, n), value, dtype=torch.float16),
+        },
+    )
+
+
+def test_wire_latency_delays_delivery(monkeypatch):
+    """A configured one-way latency delays every hop by at least that amount,
+    and FIFO ordering is preserved across packets."""
+    sender, receiver = _make_wire_pair(monkeypatch, "60", "0", 15301)
+    try:
+        assert sender._wire_thread is not None
+        t0 = time.perf_counter()
+        for i in range(3):
+            sender.send_tensor_packet(_tensor_packet(f"r{i}", float(i)))
+        for i in range(3):
+            received = receiver.recv_tensor_packet(device="cpu")
+            assert received.req_ids == [f"r{i}"]
+        elapsed = time.perf_counter() - t0
+        # First packet alone must pay the full one-way latency.
+        assert elapsed >= 0.055, f"latency not applied: {elapsed:.3f}s"
+    finally:
+        sender.close()
+        receiver.close()
+
+
+def test_wire_bandwidth_serializes_delivery(monkeypatch):
+    """The bps cap serializes the wire: back-to-back packets arrive spaced by
+    at least bytes/bps."""
+    # Payload ~4.2KB per packet; cap 100 B/ms -> >=42 ms between arrivals.
+    sender, receiver = _make_wire_pair(monkeypatch, "0", "100000", 15311)
+    try:
+        sender.send_tensor_packet(_tensor_packet("a", 1.0))
+        sender.send_tensor_packet(_tensor_packet("b", 2.0))
+        t0 = time.perf_counter()
+        first = receiver.recv_tensor_packet(device="cpu")
+        t_first = time.perf_counter() - t0
+        second = receiver.recv_tensor_packet(device="cpu")
+        t_second = time.perf_counter() - t0
+        assert first.req_ids == ["a"]
+        assert second.req_ids == ["b"]
+        nbytes = 2048 * 2  # hidden fp16 payload bytes (lower bound)
+        assert t_second - t_first >= nbytes / 100000 * 0.9, (
+            f"wire not serialized: gap {t_second - t_first:.3f}s"
+        )
+    finally:
+        sender.close()
+        receiver.close()
+
+
+def test_wire_close_drains_in_flight(monkeypatch):
+    """close() must not lose a packet still inside the synthetic wire."""
+    sender, receiver = _make_wire_pair(monkeypatch, "80", "0", 15321)
+    sender.send_tensor_packet(_tensor_packet("last", 9.0))
+    sender.close()  # returns only after the wire has delivered
+    received = receiver.recv_tensor_packet(device="cpu")
+    assert received.req_ids == ["last"]
+    receiver.close()

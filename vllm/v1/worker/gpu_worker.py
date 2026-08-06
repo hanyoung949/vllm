@@ -947,6 +947,11 @@ class Worker(WorkerBase):
         if runtime is not None:
             runtime.reset_metrics()
 
+    def get_dvi_metrics_snapshot(self) -> dict | None:
+        """Return this worker's structured Stage-DVI metrics, if enabled."""
+        runtime = getattr(self.model_runner, "split_dvi_runtime", None)
+        return runtime.metrics_snapshot() if runtime is not None else None
+
     def get_model(self) -> nn.Module:
         return self.model_runner.get_model()
 

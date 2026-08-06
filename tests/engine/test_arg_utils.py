@@ -10,6 +10,7 @@ import pytest
 from pydantic import Field
 
 from vllm.config import AttentionConfig, CompilationConfig, ModelConfig, config
+from vllm.config.quantization import QuantizationConfigArgs
 from vllm.engine.arg_utils import (
     EngineArgs,
     _expand_json_human_readable_numbers,
@@ -204,6 +205,15 @@ def test_get_kwargs():
     assert json_tip in kwargs["json_tip"]["help"]
     # nested config should construct the nested config
     assert kwargs["nested_config"]["type"]('{"field": 2}') == NestedConfig(2)  # type: ignore[call-arg]
+
+
+def test_engine_args_resolves_forward_annotation():
+    kwargs = get_kwargs(EngineArgs)["quantization_config"]
+
+    assert kwargs["type"](
+        '{"ignore": ["lm_head"]}'
+    ) == QuantizationConfigArgs(ignore=["lm_head"])
+    assert kwargs["type"]("None") is None
 
 
 def test_jit_monitor_verbose_arg():

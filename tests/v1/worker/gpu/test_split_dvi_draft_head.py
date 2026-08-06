@@ -230,6 +230,56 @@ def test_dtype_conversion(tmp_path):
     assert head(torch.randn(2, HIDDEN, dtype=torch.bfloat16)).dtype == torch.bfloat16
 
 
+def test_raw_logits_are_temperature_scaled():
+    head = SplitDVIDraftHead(
+        torch.nn.Linear(HIDDEN, VOCAB, bias=False),
+        None,
+        None,
+        None,
+        1.0,
+    )
+    logits = torch.tensor([[1.4, 0.7], [2.8, -0.7]])
+    temperatures = torch.tensor([0.7, 1.4])
+    expected = torch.tensor([[2.0, 1.0], [2.0, -0.5]])
+    torch.testing.assert_close(
+        head.process_support_logits(logits, temperatures), expected
+    )
+
+
+def test_processed_logits_skip_temperature_and_require_match():
+    head = SplitDVIDraftHead(
+        torch.nn.Linear(HIDDEN, VOCAB, bias=False),
+        None,
+        None,
+        None,
+        1.0,
+        logit_semantics="processed_at_temperature",
+        calibration_temperature=0.7,
+    )
+    logits = torch.tensor([[1.4, 0.7], [2.8, -0.7]])
+    temperatures = torch.tensor([0.7, 0.7])
+    torch.testing.assert_close(
+        head.process_support_logits(logits, temperatures), logits
+    )
+    with pytest.raises(ValueError, match="request temperatures"):
+        head.process_support_logits(logits, torch.tensor([0.7, 0.8]))
+
+
+def test_processed_checkpoint_requires_calibration_temperature(tmp_path):
+    path = _write_safetensors_checkpoint(
+        tmp_path,
+        _random_state(),
+        {
+            "norm": "none",
+            "rank": RANK,
+            "alpha": ALPHA,
+            "draft_logit_semantics": "processed_at_temperature",
+        },
+    )
+    with pytest.raises(ValueError, match="calibration_temperature"):
+        load_draft_head_from_checkpoint(path, _cfg(), DEVICE)
+
+
 def _compact_metadata(weight: torch.Tensor) -> dict:
     return {
         "norm": "none",

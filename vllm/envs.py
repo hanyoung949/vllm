@@ -50,6 +50,8 @@ if TYPE_CHECKING:
     VLLM_PP_LAYER_PARTITION: str | None = None
     VLLM_SPLIT_TENSOR_RECV_ADDRS: str | None = None
     VLLM_SPLIT_TOKEN_RECV_ADDRS: str | None = None
+    VLLM_SPLIT_TRANSPORT_LATENCY_MS: float = 0.0
+    VLLM_SPLIT_TRANSPORT_BPS: float = 0.0
     VLLM_SPLIT_ENDPOINT_REGISTRY_NAME: str | None = None
     VLLM_SPLIT_STAGE_NODE_MAP: str | None = None
     VLLM_CPU_KVCACHE_SPACE: int | None = 0
@@ -836,6 +838,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Comma-separated ZMQ receive addresses for sampled token broadcast from stage_2.
     "VLLM_SPLIT_TOKEN_RECV_ADDRS": lambda: os.getenv(
         "VLLM_SPLIT_TOKEN_RECV_ADDRS", None
+    ),
+    # Synthetic one-way wire latency (ms) applied to every split transport
+    # send hop, for cross-machine deployment simulation. 0 disables.
+    "VLLM_SPLIT_TRANSPORT_LATENCY_MS": lambda: float(
+        os.getenv("VLLM_SPLIT_TRANSPORT_LATENCY_MS", "0")
+    ),
+    # Synthetic wire bandwidth cap (bytes/sec) applied to every split
+    # transport send hop, for cross-machine deployment simulation. 0 disables.
+    "VLLM_SPLIT_TRANSPORT_BPS": lambda: float(
+        os.getenv("VLLM_SPLIT_TRANSPORT_BPS", "0")
     ),
     # Ray actor name for layer-wise split endpoint auto-discovery.
     "VLLM_SPLIT_ENDPOINT_REGISTRY_NAME": lambda: os.getenv(

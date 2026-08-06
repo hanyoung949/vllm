@@ -9,11 +9,11 @@ protocol:
   fixed draft head mounted on its boundary hidden states;
 - the full block of boundary ``IntermediateTensors`` is sent to ``stage_1`` /
   ``stage_2`` in one packet;
-- ``stage_2`` runs greedy block verification and returns up to
+- ``stage_2`` runs greedy or exact stochastic block verification and returns up to
   ``draft_length`` committed tokens through the usual ``SplitTokenPacket``.
 
-The v1 scope is deliberately narrow: V2 model runner only, greedy sampling
-only, no bonus token, no draft-head training, no hot updates.  KV lifecycle
+The initial scope is deliberately narrow: V2 model runner only, plain
+temperature/top-k/top-p sampling, no draft-head training, no hot updates. KV lifecycle
 reuses the native V2 spec-decode semantics (``num_sampled``/``num_rejected``
 and ``num_computed_tokens`` rollback) — the "recompute" mode from the design
 doc is not needed because the PP decode cadence plus placeholder scheduling
@@ -43,7 +43,7 @@ class SplitDVIConfig:
     baseline layer-wise split (zero behavior change)."""
 
     mode: str = "greedy"
-    """Verification mode.  v1 only supports ``"greedy"``."""
+    """Verification mode: ``"greedy"`` | ``"stochastic"``."""
 
     draft_length: int = 4
     """Number of block positions k per DVI cycle: 1 boundary forward plus
@@ -52,7 +52,11 @@ class SplitDVIConfig:
     one bonus position of scheduler accounting."""
 
     bonus_token: bool = False
-    """v1 does not support bonus tokens; must stay False."""
+    """Stochastic mode uses standard k-1 proposals plus one target bonus row.
+    Greedy mode retains the original k-proposal/no-bonus protocol."""
+
+    draft_top_k: int = 16
+    """Bounded support size for stochastic draft proposals."""
 
     # ---- draft head -----------------------------------------------------
     draft_head_path: str | None = None
@@ -102,12 +106,20 @@ class SplitDVIConfig:
     def __post_init__(self) -> None:
         if not self.enabled:
             return
-        if self.mode != "greedy":
+        if self.mode not in ("greedy", "stochastic"):
             raise ValueError(
-                f"SplitDVI only supports mode='greedy' in v1, got {self.mode!r}"
+                "SplitDVI mode must be 'greedy' or 'stochastic', got "
+                f"{self.mode!r}"
             )
-        if self.bonus_token:
-            raise ValueError("SplitDVI v1 does not support bonus_token=True")
+        if self.mode == "greedy" and self.bonus_token:
+            raise ValueError("SplitDVI greedy mode does not support bonus_token=True")
+        if self.mode == "stochastic" and not self.bonus_token:
+            raise ValueError(
+                "SplitDVI stochastic mode requires bonus_token=True "
+                "(k-1 proposals plus one target row)"
+            )
+        if self.draft_top_k <= 0:
+            raise ValueError("draft_top_k must be positive")
         if not (2 <= self.draft_length <= self.max_draft_length):
             raise ValueError(
                 f"draft_length must be in [2, {self.max_draft_length}], got "

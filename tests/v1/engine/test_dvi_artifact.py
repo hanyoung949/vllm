@@ -18,6 +18,7 @@ from vllm.v1.worker.gpu.split_dvi.artifact import (
     DVIArtifactWriter,
     DVICaptureRecord,
     DVIEvalRecord,
+    DVIEvaluationRecord,
     DVIRequestRecord,
 )
 
@@ -638,3 +639,123 @@ def test_manifest_vocab_size_must_be_positive(tmp_path: Path) -> None:
     with pytest.raises(DVIArtifactError, match="vocab_size must be positive"):
         with DVIArtifactWriter(out_dir, manifest) as writer:
             pass
+
+
+
+def _make_v2_evaluation_records(
+    manifest: DVIArtifactManifest,
+    request_id: str = "r0",
+    *,
+    rejected: bool = False,
+) -> list[DVIEvaluationRecord]:
+    proposal_count = manifest.draft_length - 1
+    committed = [10, 11] if rejected else [10, 11, 12, 13]
+    accepted_count = 1 if rejected else proposal_count
+    advancement = len(committed)
+    records: list[DVIEvaluationRecord] = []
+    for row_index in range(proposal_count + 1):
+        is_proposal = row_index < proposal_count
+        logits = torch.full((manifest.vocab_size,), -10.0)
+        logits[20 + row_index] = 10.0
+        topk_ids, topk_lps, residual, top1_id = _logits_to_topk(logits, 2)
+        records.append(
+            DVIEvaluationRecord(
+                request_id=request_id,
+                cycle_id=3,
+                generation_id=7,
+                row_index=row_index,
+                absolute_position=row_index,
+                row_kind="proposal" if is_proposal else "bonus",
+                num_proposals=proposal_count,
+                draft_token_id=100 + row_index if is_proposal else None,
+                draft_support_token_ids=[100 + row_index, 200 + row_index]
+                if is_proposal
+                else [],
+                draft_support_logits=[1.0, 0.0] if is_proposal else [],
+                stage_0_hidden=torch.zeros(
+                    manifest.hidden_size, dtype=torch.float32
+                ),
+                verifier_topk_ids=topk_ids,
+                verifier_topk_logprobs=topk_lps,
+                verifier_residual_mass=residual,
+                teacher_probs_on_draft_support=[0.9, 0.0]
+                if is_proposal
+                else [],
+                accepted=(
+                    True if is_proposal and row_index < accepted_count else
+                    False if is_proposal and row_index == accepted_count else None
+                ),
+                accepted_count=accepted_count,
+                committed_token_ids=committed if row_index == 0 else [],
+                correction_token_id=(
+                    committed[-1] if rejected and row_index == 0 else None
+                ),
+                terminal_token_id=(
+                    committed[-1] if row_index == 0 else None
+                ),
+                advancement=advancement if row_index == 0 else 0,
+            )
+        )
+    return records
+
+
+def _make_v2_manifest() -> DVIArtifactManifest:
+    return _make_manifest(
+        schema_version="v2",
+        capture_mode="evaluation",
+        policy_version="policy5",
+        num_proposals=3,
+        bonus_token=True,
+        dtype="float32",
+    )
+
+
+def test_v2_evaluation_round_trip_preserves_bonus_contract(tmp_path: Path) -> None:
+    manifest = _make_v2_manifest()
+    request = _make_request(response_len=4)
+    records = _make_v2_evaluation_records(manifest)
+    out_dir = tmp_path / "evaluation-artifact"
+
+    with DVIArtifactWriter(out_dir, manifest) as writer:
+        writer.write_requests([request])
+        writer.write_evaluation_records(records)
+
+    reader = DVIArtifactReader(out_dir)
+    loaded = list(reader.iter_evaluation_records())
+    assert len(loaded) == 4
+    assert loaded[-1].row_kind == "bonus"
+    assert loaded[-1].draft_token_id is None
+    assert loaded[-1].draft_support_token_ids == []
+    assert loaded[0].advancement == 4
+    assert loaded[0].correction_token_id is None
+    assert loaded[0].committed_token_ids == [10, 11, 12, 13]
+
+
+def test_v2_evaluation_reject_records_store_correction_token(
+    tmp_path: Path,
+) -> None:
+    manifest = _make_v2_manifest()
+    request = _make_request(response_len=4)
+    records = _make_v2_evaluation_records(manifest, rejected=True)
+    out_dir = tmp_path / "evaluation-artifact"
+
+    with DVIArtifactWriter(out_dir, manifest) as writer:
+        writer.write_requests([request])
+        writer.write_evaluation_records(records)
+
+    loaded = list(DVIArtifactReader(out_dir).iter_evaluation_records())
+    assert loaded[0].accepted_count == 1
+    assert loaded[0].advancement == 2
+    assert loaded[0].correction_token_id == 11
+
+
+def test_v2_bonus_row_rejects_draft_fields(tmp_path: Path) -> None:
+    manifest = _make_v2_manifest()
+    request = _make_request(response_len=4)
+    records = _make_v2_evaluation_records(manifest)
+    records[-1].draft_token_id = 999
+
+    with pytest.raises(DVIArtifactError, match="bonus rows"):
+        with DVIArtifactWriter(tmp_path / "evaluation-artifact", manifest) as writer:
+            writer.write_requests([request])
+            writer.write_evaluation_records(records)

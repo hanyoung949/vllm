@@ -14,6 +14,7 @@ metadata (KV cache is not transferred across stages).
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -113,6 +114,11 @@ class _SplitTensorPacketSerialized(msgspec.Struct):
     draft_positions: list[int] | None = None
     policy_version: str | None = None
     draft_version: str | None = None
+    sampling_mode: str | None = None
+    draft_support_offsets: list[int] | None = None
+    draft_support_token_ids: list[int] | None = None
+    draft_support_logits: list[float] | None = None
+    is_fallback: bool = False
 
 
 @dataclass
@@ -144,6 +150,11 @@ class SplitTensorPacket:
     draft_positions: list[int] | None = None
     policy_version: str | None = None
     draft_version: str | None = None
+    sampling_mode: str | None = None
+    draft_support_offsets: list[int] | None = None
+    draft_support_token_ids: list[int] | None = None
+    draft_support_logits: list[float] | None = None
+    is_fallback: bool = False
 
     @property
     def is_dvi_block(self) -> bool:
@@ -167,6 +178,11 @@ class SplitTensorPacket:
         draft_positions: list[int] | None = None,
         policy_version: str | None = None,
         draft_version: str | None = None,
+        sampling_mode: str | None = None,
+        draft_support_offsets: list[int] | None = None,
+        draft_support_token_ids: list[int] | None = None,
+        draft_support_logits: list[float] | None = None,
+        is_fallback: bool = False,
     ) -> "SplitTensorPacket":
         return cls(
             req_ids=req_ids,
@@ -181,6 +197,11 @@ class SplitTensorPacket:
             draft_positions=draft_positions,
             policy_version=policy_version,
             draft_version=draft_version,
+            sampling_mode=sampling_mode,
+            draft_support_offsets=draft_support_offsets,
+            draft_support_token_ids=draft_support_token_ids,
+            draft_support_logits=draft_support_logits,
+            is_fallback=is_fallback,
         )
 
     def validate(
@@ -211,6 +232,11 @@ class SplitTensorPacket:
                 or self.draft_positions is not None
                 or self.policy_version is not None
                 or self.draft_version is not None
+                or self.sampling_mode is not None
+                or self.draft_support_offsets is not None
+                or self.draft_support_token_ids is not None
+                or self.draft_support_logits is not None
+                or self.is_fallback
             ):
                 raise SplitDVIProtocolError(
                     "SplitTensorPacket kind is NORMAL but DVI metadata is set"
@@ -283,6 +309,64 @@ class SplitTensorPacket:
                         f"Draft token id {token_id} out of vocab range "
                         f"[0, {vocab_size})"
                     )
+        sampling_mode = self.sampling_mode or "greedy"
+        support_fields = (
+            self.draft_support_offsets,
+            self.draft_support_token_ids,
+            self.draft_support_logits,
+        )
+        if sampling_mode == "greedy":
+            if any(field is not None for field in support_fields):
+                raise SplitDVIProtocolError(
+                    "Greedy DVI block must not carry stochastic support fields"
+                )
+        elif sampling_mode == "stochastic":
+            if any(field is None for field in support_fields):
+                raise SplitDVIProtocolError(
+                    "Stochastic DVI block missing draft support fields"
+                )
+            assert self.draft_support_offsets is not None
+            assert self.draft_support_token_ids is not None
+            assert self.draft_support_logits is not None
+            offsets = self.draft_support_offsets
+            if len(offsets) != len(self.draft_token_ids) + 1:
+                raise SplitDVIProtocolError(
+                    "draft_support_offsets length must equal "
+                    "len(draft_token_ids) + 1"
+                )
+            if not offsets or offsets[0] != 0:
+                raise SplitDVIProtocolError(
+                    "draft_support_offsets must start at zero"
+                )
+            if any(b <= a for a, b in zip(offsets, offsets[1:])):
+                raise SplitDVIProtocolError(
+                    "draft_support_offsets must be strictly increasing"
+                )
+            if offsets[-1] != len(self.draft_support_token_ids):
+                raise SplitDVIProtocolError(
+                    "draft support offset terminus does not match token ids"
+                )
+            if len(self.draft_support_token_ids) != len(
+                self.draft_support_logits
+            ):
+                raise SplitDVIProtocolError(
+                    "draft support token ids/logits length mismatch"
+                )
+            if not all(math.isfinite(x) for x in self.draft_support_logits):
+                raise SplitDVIProtocolError(
+                    "draft support logits must all be finite"
+                )
+            if vocab_size is not None:
+                for token_id in self.draft_support_token_ids:
+                    if not 0 <= token_id < vocab_size:
+                        raise SplitDVIProtocolError(
+                            f"Draft support token id {token_id} out of vocab "
+                            f"range [0, {vocab_size})"
+                        )
+        else:
+            raise SplitDVIProtocolError(
+                f"Unsupported DVI sampling_mode {sampling_mode!r}"
+            )
         num_rows = sum(self.num_scheduled_tokens)
         for key, tensor in self.tensors.items():
             if tensor.shape[0] != num_rows:
@@ -334,6 +418,11 @@ class SplitTensorPacket:
             draft_positions=self.draft_positions,
             policy_version=self.policy_version,
             draft_version=self.draft_version,
+            sampling_mode=self.sampling_mode,
+            draft_support_offsets=self.draft_support_offsets,
+            draft_support_token_ids=self.draft_support_token_ids,
+            draft_support_logits=self.draft_support_logits,
+            is_fallback=self.is_fallback,
         )
         metadata_bytes = msgspec.msgpack.encode(metadata)
 
@@ -382,6 +471,11 @@ class SplitTensorPacket:
             draft_positions=metadata.draft_positions,
             policy_version=metadata.policy_version,
             draft_version=metadata.draft_version,
+            sampling_mode=metadata.sampling_mode,
+            draft_support_offsets=metadata.draft_support_offsets,
+            draft_support_token_ids=metadata.draft_support_token_ids,
+            draft_support_logits=metadata.draft_support_logits,
+            is_fallback=metadata.is_fallback,
         )
 
 

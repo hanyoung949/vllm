@@ -63,6 +63,8 @@ class SplitDVIDraftHead(nn.Module):
         lora_a: nn.Linear | None,
         lora_b: nn.Linear | None,
         scaling: float,
+        logit_semantics: str = "raw_target_logits",
+        calibration_temperature: float | None = None,
     ):
         super().__init__()
         for param in base_projection.parameters():
@@ -72,6 +74,8 @@ class SplitDVIDraftHead(nn.Module):
         self.lora_a = lora_a
         self.lora_b = lora_b
         self.scaling = scaling
+        self.logit_semantics = logit_semantics
+        self.calibration_temperature = calibration_temperature
 
     @property
     def vocab_size(self) -> int:
@@ -95,6 +99,30 @@ class SplitDVIDraftHead(nn.Module):
         """Greedy draft proposal: argmax over the draft logits."""
         return self.forward(boundary_hidden).argmax(dim=-1)
 
+    def process_support_logits(
+        self,
+        support_logits: torch.Tensor,
+        temperatures: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return support logits in the request sampling distribution."""
+        logits = support_logits.to(torch.float32)
+        if self.logit_semantics == "raw_target_logits":
+            return logits / temperatures.unsqueeze(1)
+        if self.logit_semantics != "processed_at_temperature":
+            raise ValueError(
+                f"Unsupported draft logit semantics {self.logit_semantics!r}"
+            )
+        assert self.calibration_temperature is not None
+        expected = torch.full_like(temperatures, self.calibration_temperature)
+        if not torch.allclose(temperatures, expected, rtol=0.0, atol=1e-6):
+            actual = temperatures.detach().float().cpu().tolist()
+            raise ValueError(
+                "Draft head was calibrated on processed logits at temperature "
+                f"{self.calibration_temperature}, but request temperatures are "
+                f"{actual}"
+            )
+        return logits
+
 
 @dataclass
 class DraftHeadMetadata:
@@ -105,6 +133,8 @@ class DraftHeadMetadata:
     hidden_size: int | None = None
     base_projection_source: str | None = None
     base_projection_sha256: str | None = None
+    logit_semantics: str = "raw_target_logits"
+    calibration_temperature: float | None = None
 
 
 def _sha256_tensor(tensor: torch.Tensor) -> str:
@@ -213,8 +243,31 @@ def _build_from_state(
             lora_a.weight.copy_(a_weight)
             lora_b.weight.copy_(b_weight)
 
+    if metadata.logit_semantics not in {
+        "raw_target_logits",
+        "processed_at_temperature",
+    }:
+        raise ValueError(
+            f"Unsupported draft logit semantics {metadata.logit_semantics!r}"
+        )
+    if metadata.logit_semantics == "processed_at_temperature":
+        temperature = metadata.calibration_temperature
+        if temperature is None or not (temperature > 0):
+            raise ValueError(
+                "processed_at_temperature draft heads require a positive "
+                "calibration_temperature"
+            )
+
     scaling = metadata.alpha / metadata.rank
-    head = SplitDVIDraftHead(base_projection, norm, lora_a, lora_b, scaling)
+    head = SplitDVIDraftHead(
+        base_projection,
+        norm,
+        lora_a,
+        lora_b,
+        scaling,
+        metadata.logit_semantics,
+        metadata.calibration_temperature,
+    )
     return head.to(device=device, dtype=dtype)
 
 
@@ -235,6 +288,10 @@ def load_draft_head_from_checkpoint(
         hidden_size=raw_metadata.get("hidden_size"),
         base_projection_source=raw_metadata.get("base_projection_source"),
         base_projection_sha256=raw_metadata.get("base_projection_sha256"),
+        logit_semantics=raw_metadata.get(
+            "draft_logit_semantics", "raw_target_logits"
+        ),
+        calibration_temperature=raw_metadata.get("calibration_temperature"),
     )
     if config.draft_head_norm == "rmsnorm" and metadata.norm != "rmsnorm":
         raise ValueError(

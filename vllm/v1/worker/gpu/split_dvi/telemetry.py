@@ -402,6 +402,11 @@ class DVIPartialSpoolWriter:
         self.spool_metadata = dict(spool_metadata)
         self.quota_bytes = quota_bytes
         self.shard_size = shard_size
+        self.spool_schema_version = (
+            "spool-v2"
+            if self.spool_metadata.get("capture_mode") == "evaluation"
+            else self.SPOOL_SCHEMA_VERSION
+        )
         self.queue_maxsize = queue_maxsize
 
         self.spool_dir.mkdir(parents=True, exist_ok=True)
@@ -410,6 +415,9 @@ class DVIPartialSpoolWriter:
                 f"Spool directory is not empty: {self.spool_dir}"
             )
 
+        self._evaluation_stage0_enqueued = 0
+        self._evaluation_stage2_enqueued = 0
+        self._evaluation_finalization_enqueued = 0
         self._used_bytes = 0
         self._pending_bytes = 0
         self._dropped_records = 0
@@ -439,6 +447,9 @@ class DVIPartialSpoolWriter:
             "stage0_enqueued": self._stage0_enqueued,
             "stage2_enqueued": self._stage2_enqueued,
             "request_enqueued": self._request_enqueued,
+            "evaluation_stage0_enqueued": self._evaluation_stage0_enqueued,
+            "evaluation_stage2_enqueued": self._evaluation_stage2_enqueued,
+            "evaluation_finalization_enqueued": self._evaluation_finalization_enqueued,
             "dropped_records": self._dropped_records,
             "quota_exceeded": self._quota_exceeded,
             "queue_maxsize": self.queue_maxsize,
@@ -509,6 +520,12 @@ class DVIPartialSpoolWriter:
                 self._stage2_enqueued += 1
             elif item.kind == "request":
                 self._request_enqueued += 1
+            elif item.kind == "evaluation_stage0":
+                self._evaluation_stage0_enqueued += len(item.data["records"])
+            elif item.kind == "evaluation_stage2":
+                self._evaluation_stage2_enqueued += len(item.data)
+            elif item.kind == "evaluation_finalization":
+                self._evaluation_finalization_enqueued += len(item.data)
             try:
                 self._queue.put_nowait(item)
             except queue.Full:
@@ -519,6 +536,14 @@ class DVIPartialSpoolWriter:
                     self._stage2_enqueued -= 1
                 elif item.kind == "request":
                     self._request_enqueued -= 1
+                elif item.kind == "evaluation_stage0":
+                    self._evaluation_stage0_enqueued -= len(
+                        item.data["records"]
+                    )
+                elif item.kind == "evaluation_stage2":
+                    self._evaluation_stage2_enqueued -= len(item.data)
+                elif item.kind == "evaluation_finalization":
+                    self._evaluation_finalization_enqueued -= len(item.data)
                 self._dropped_records += 1
                 return False
             self._max_queue_depth = max(
@@ -570,6 +595,86 @@ class DVIPartialSpoolWriter:
             _QueueItem(kind="request", key=None, data=rec)
         )
 
+    def enqueue_evaluation_stage0(
+        self,
+        session_key: DVISessionKey,
+        records: list[dict[str, Any]],
+        hidden_rows: list[torch.Tensor],
+    ) -> bool:
+        """Enqueue all draft rows for one evaluation cycle."""
+        if self.spool_schema_version != "spool-v2":
+            raise DVIArtifactError(
+                "evaluation capture requires spool metadata capture_mode='evaluation'"
+            )
+        if len(records) != len(hidden_rows):
+            raise DVIArtifactError("evaluation stage0 records/hidden length mismatch")
+        enriched: list[dict[str, Any]] = []
+        for record in records:
+            item = dict(record)
+            item["key"] = {
+                "run_id": session_key[0],
+                "rollout_id": session_key[1],
+                "policy_version": session_key[2],
+                "request_id": str(item["request_id"]),
+                "cycle_id": int(item["cycle_id"]),
+                "row_index": int(item["row_index"]),
+            }
+            enriched.append(item)
+        return self._enqueue(
+            _QueueItem(
+                kind="evaluation_stage0",
+                key=None,
+                data={"records": enriched, "hidden_rows": hidden_rows},
+            )
+        )
+
+    def enqueue_evaluation_stage2(
+        self,
+        session_key: DVISessionKey,
+        records: list[dict[str, Any]],
+    ) -> bool:
+        """Enqueue teacher rows and realized verifier decisions."""
+        if self.spool_schema_version != "spool-v2":
+            raise DVIArtifactError(
+                "evaluation capture requires spool metadata capture_mode='evaluation'"
+            )
+        enriched: list[dict[str, Any]] = []
+        for record in records:
+            item = dict(record)
+            item["key"] = {
+                "run_id": session_key[0],
+                "rollout_id": session_key[1],
+                "policy_version": session_key[2],
+                "request_id": str(item["request_id"]),
+                "cycle_id": int(item["cycle_id"]),
+                "row_index": int(item["row_index"]),
+            }
+            enriched.append(item)
+        return self._enqueue(
+            _QueueItem(kind="evaluation_stage2", key=None, data=enriched)
+        )
+
+    def _estimate_evaluation_stage0(self, data: dict[str, Any]) -> int:
+        records = data["records"]
+        hidden_rows = data["hidden_rows"]
+        return sum(
+            hidden.element_size() * hidden.nelement()
+            for hidden in hidden_rows
+        ) + len(json.dumps(records, ensure_ascii=False).encode("utf-8")) + 512
+
+    def _estimate_evaluation_stage2(self, records: list[dict[str, Any]]) -> int:
+        return len(json.dumps(records, ensure_ascii=False).encode("utf-8")) + 512
+
+    def enqueue_evaluation_finalization(self, session_key: DVISessionKey, records: list[dict[str, Any]]) -> bool:
+        if self.spool_schema_version != "spool-v2":
+            raise DVIArtifactError("evaluation finalization requires spool-v2")
+        enriched = []
+        for record in records:
+            item = dict(record)
+            item["key"] = {"run_id": session_key[0], "rollout_id": session_key[1], "policy_version": session_key[2], "request_id": str(item["request_id"]), "cycle_id": int(item["cycle_id"])}
+            enriched.append(item)
+        return self._enqueue(_QueueItem(kind="evaluation_finalization", key=None, data=enriched))
+
     def _estimate_stage0(self, hidden: torch.Tensor) -> int:
         return hidden.element_size() * hidden.nelement() + 256
 
@@ -612,6 +717,43 @@ class DVIPartialSpoolWriter:
             if len(self._stage2_buffer) >= self.shard_size:
                 self._flush_stage2_shard()
 
+        elif item.kind == "evaluation_stage0":
+            data = item.data
+            estimated = self._estimate_evaluation_stage0(data)
+            if not self._have_quota(estimated):
+                return
+            cpu_hidden: list[torch.Tensor] = []
+            for hidden in data["hidden_rows"]:
+                if not isinstance(hidden, torch.Tensor):
+                    self._dropped_records += 1
+                    return
+                cpu_hidden.append(hidden.detach().to(device="cpu").contiguous())
+            data["hidden_rows"] = cpu_hidden
+            # Store the enqueue-time estimate alongside the payload so the
+            # flush subtracts exactly what was added (paired accounting).
+            self._evaluation_stage0_buffer.append((estimated, data))
+            self._pending_bytes += estimated
+
+        elif item.kind == "evaluation_stage2":
+            records = item.data
+            estimated = self._estimate_evaluation_stage2(records)
+            if not self._have_quota(estimated):
+                return
+            # The estimate covers the whole batch (single +512 overhead), so
+            # keep the batch boundary: flushing per-record estimates would
+            # over-subtract and drive pending_bytes negative.
+            self._evaluation_stage2_buffer.append((estimated, records))
+            self._pending_bytes += estimated
+
+        elif item.kind == "evaluation_finalization":
+            records = item.data
+            estimated = len(json.dumps(records, ensure_ascii=False).encode("utf-8")) + 512
+            if not self._have_quota(estimated):
+                return
+            # Same batch-boundary pairing as evaluation_stage2.
+            self._evaluation_finalization_buffer.append((estimated, records))
+            self._pending_bytes += estimated
+
         elif item.kind == "request":
             rec = item.data
             estimated = self._estimate_request(rec)
@@ -622,6 +764,12 @@ class DVIPartialSpoolWriter:
 
     def _writer_thread(self) -> None:
         self._stage0_buffer: list[tuple[DVIRecordKey, torch.Tensor]] = []
+        self._evaluation_stage0_buffer: list[tuple[int, dict[str, Any]]] = []
+        self._evaluation_stage2_buffer: list[tuple[int, list[dict[str, Any]]]] = []
+        self._evaluation_finalization_buffer: list[tuple[int, list[dict[str, Any]]]] = []
+        self._evaluation_finalization_shard_idx = 0
+        self._evaluation_stage0_shard_idx = 0
+        self._evaluation_stage2_shard_idx = 0
         self._stage2_buffer: list[dict[str, Any]] = []
         self._request_buffer: list[dict[str, Any]] = []
         self._stage0_shard_idx = 0
@@ -648,6 +796,9 @@ class DVIPartialSpoolWriter:
                     break
                 self._process_item(item)
 
+            self._flush_evaluation_stage0_shard()
+            self._flush_evaluation_stage2_shard()
+            self._flush_evaluation_finalization_shard()
             self._flush_stage0_shard()
             self._flush_stage2_shard()
             self._flush_requests()
@@ -734,7 +885,7 @@ class DVIPartialSpoolWriter:
                 file_checksums[child.name] = _sha256_file(child)
         manifest = {
             **self.spool_metadata,
-            "schema_version": self.SPOOL_SCHEMA_VERSION,
+            "schema_version": self.spool_schema_version,
             "finalized": True,
             "file_checksums": file_checksums,
             "metrics": self.metrics,
@@ -743,6 +894,89 @@ class DVIPartialSpoolWriter:
         with open(tmp_path, "w", encoding="utf-8") as f:
             json.dump(manifest, f, indent=2, ensure_ascii=False)
         os.replace(tmp_path, self.spool_dir / "spool_manifest.json")
+
+    def _flush_evaluation_stage0_shard(self) -> None:
+        if not self._evaluation_stage0_buffer:
+            return
+        idx = self._evaluation_stage0_shard_idx
+        jsonl_name = f"evaluation-stage0-{idx:05d}.jsonl"
+        st_name = f"evaluation-stage0-{idx:05d}.safetensors"
+        jsonl_tmp = self.spool_dir / f".tmp.{jsonl_name}"
+        st_tmp = self.spool_dir / f".tmp.{st_name}"
+        tensors: dict[str, torch.Tensor] = {}
+        json_records: list[dict[str, Any]] = []
+        record_index = 0
+        estimated = 0
+        for enqueued_estimate, data in self._evaluation_stage0_buffer:
+            records = data["records"]
+            hidden_rows = data["hidden_rows"]
+            if len(records) != len(hidden_rows):
+                raise DVIArtifactError(
+                    "evaluation stage0 records/hidden length mismatch at flush"
+                )
+            estimated += enqueued_estimate
+            for record, hidden in zip(records, hidden_rows):
+                key = f"e0-{idx:05d}-{record_index:05d}-h"
+                tensors[key] = hidden
+                output = dict(record)
+                output["hidden_key"] = key
+                json_records.append(output)
+                record_index += 1
+        with open(jsonl_tmp, "w", encoding="utf-8") as f:
+            for record in json_records:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        save_safetensors(tensors, str(st_tmp))
+        jsonl_path = self.spool_dir / jsonl_name
+        st_path = self.spool_dir / st_name
+        os.replace(jsonl_tmp, jsonl_path)
+        os.replace(st_tmp, st_path)
+        self._pending_bytes -= estimated
+        self._used_bytes += jsonl_path.stat().st_size + st_path.stat().st_size
+        self._evaluation_stage0_buffer = []
+        self._evaluation_stage0_shard_idx += 1
+
+    def _flush_evaluation_stage2_shard(self) -> None:
+        if not self._evaluation_stage2_buffer:
+            return
+        idx = self._evaluation_stage2_shard_idx
+        name = f"evaluation-stage2-{idx:05d}.jsonl"
+        tmp_path = self.spool_dir / f".tmp.{name}"
+        estimated = sum(
+            enqueued_estimate
+            for enqueued_estimate, _ in self._evaluation_stage2_buffer
+        )
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            for _, records in self._evaluation_stage2_buffer:
+                for record in records:
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        final_path = self.spool_dir / name
+        os.replace(tmp_path, final_path)
+        self._pending_bytes -= estimated
+        self._used_bytes += final_path.stat().st_size
+        self._evaluation_stage2_buffer = []
+        self._evaluation_stage2_shard_idx += 1
+
+    def _flush_evaluation_finalization_shard(self) -> None:
+        if not self._evaluation_finalization_buffer:
+            return
+        idx = self._evaluation_finalization_shard_idx
+        name = f"evaluation-finalization-{idx:05d}.jsonl"
+        tmp = self.spool_dir / f".tmp.{name}"
+        estimated = sum(
+            enqueued_estimate
+            for enqueued_estimate, _ in self._evaluation_finalization_buffer
+        )
+        with open(tmp, "w", encoding="utf-8") as f:
+            for _, records in self._evaluation_finalization_buffer:
+                for record in records:
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        final = self.spool_dir / name
+        os.replace(tmp, final)
+        self._pending_bytes -= estimated
+        self._used_bytes += final.stat().st_size
+        self._evaluation_finalization_buffer = []
+        self._evaluation_finalization_shard_idx += 1
+
 
     def _cleanup_tmp_files(self) -> None:
         for child in self.spool_dir.glob(".tmp.*"):
@@ -856,6 +1090,21 @@ class DVIStage0TelemetryProducer:
     def make_record_key(self, request_id: str, position: int) -> DVIRecordKey:
         """Build a validated record key for the current spool session."""
         return self.session_key + (request_id, position)
+
+    @property
+    def evaluation_mode(self) -> bool:
+        return self.writer.spool_metadata.get("capture_mode") == "evaluation"
+
+    def capture_evaluation_block(
+        self,
+        records: list[dict[str, Any]],
+        hidden_rows: list[torch.Tensor],
+    ) -> bool:
+        if not self.evaluation_mode:
+            return False
+        return self.writer.enqueue_evaluation_stage0(
+            self.session_key, records, hidden_rows
+        )
 
     def reserve(self, key: DVIRecordKey) -> DVITelemetryTicket | None:
         """Reserve a capture slot for this position.
@@ -1081,6 +1330,8 @@ class DVIStage2TelemetryProducer:
             tuple[DVITelemetryTicket, dict[str, Any] | None]
         ] = queue.SimpleQueue()
         self._capture_failed_count = 0
+        self._evaluation_request_ids: set[str] = set()
+        self._evaluation_cycles: dict[tuple[str, int], dict[str, int]] = {}
 
     @property
     def capture_failed_count(self) -> int:
@@ -1091,6 +1342,42 @@ class DVIStage2TelemetryProducer:
         if self._handoff is None:
             return {}
         return self._handoff.metrics
+
+    @property
+    def evaluation_mode(self) -> bool:
+        return self.writer.spool_metadata.get("capture_mode") == "evaluation"
+
+    def capture_evaluation_rows(
+        self,
+        records: list[dict[str, Any]],
+    ) -> bool:
+        if not self.evaluation_mode:
+            return False
+        self._evaluation_request_ids.update(str(record["request_id"]) for record in records)
+        for record in records:
+            key = (str(record["request_id"]), int(record["cycle_id"]))
+            state = self._evaluation_cycles.setdefault(
+                key,
+                {
+                    "expected": int(record["num_proposals"]) + 1,
+                    "seen": 0,
+                    "max_position": 0,
+                },
+            )
+            state["seen"] += 1
+            state["max_position"] = max(
+                state["max_position"], int(record["absolute_position"])
+            )
+            if int(record["row_index"]) == 0:
+                state.update({
+                    "accepted_count": int(record["accepted_count"]),
+                    "advancement": int(record["advancement"]),
+                    "expected_first_acceptance": record.get(
+                        "expected_first_acceptance"
+                    ),
+                    "coverage": record.get("coverage"),
+                })
+        return self.writer.enqueue_evaluation_stage2(self.session_key, records)
 
     @property
     def session_key(self) -> DVISessionKey:
@@ -1327,6 +1614,37 @@ class DVIStage2TelemetryProducer:
         response_token_ids: list[int],
     ) -> None:
         self._drain_completed()
+        if self.evaluation_mode:
+            markers = []
+            for (rid, cycle_id), state in list(self._evaluation_cycles.items()):
+                if rid != request_id:
+                    continue
+                terminal = state["max_position"] > len(response_token_ids)
+                status = "terminal_truncated" if terminal else ("complete" if state["seen"] == state["expected"] else "aborted")
+                marker = {
+                    "request_id": rid,
+                    "cycle_id": cycle_id,
+                    "num_rows_expected": state["expected"],
+                    "num_rows_seen": state["seen"],
+                    "cycle_status": status,
+                    "finalized": True,
+                }
+                if status == "complete":
+                    marker.update({
+                        "accepted_count": state["accepted_count"],
+                        "advancement": state["advancement"],
+                        "expected_first_acceptance": state[
+                            "expected_first_acceptance"
+                        ],
+                        "coverage": state["coverage"],
+                    })
+                markers.append(marker)
+                del self._evaluation_cycles[(rid, cycle_id)]
+            if markers:
+                self.writer.enqueue_evaluation_finalization(self.session_key, markers)
+            self.writer.enqueue_request(request_id, prompt_token_ids, response_token_ids)
+            self._evaluation_request_ids.discard(request_id)
+            return
         buffer_key = session_key + (request_id,)
         buf = self._buffers.get(buffer_key)
         if buf is None:

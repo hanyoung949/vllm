@@ -17,11 +17,19 @@ def test_per_request_denominators_exclude_plain_rows():
     # ac==0 counts only draft>0 rows; the plain row must not be a "reject".
     assert m.dvi_first_token_rejects == 1
     assert m.mean_advancement == 1.5
+    assert m.first_token_acceptance == 0.5
     assert m.first_token_reject_rate == 0.5
+    assert m.proposal_acceptance == 0.125
+    assert m.mean_accepted_prefix_length == 0.5
     # Batch-level companion counts all committed rows (incl. plain).
     assert m.sampled_per_cycle == 4.0
     # Histogram covers DVI rows only — the plain row's "1" must not leak in.
     assert m.sampled_hist == {1: 1, 2: 1}
+    assert m.accepted_prefix_hist == {0: 1, 1: 1}
+
+
+def test_empty_metrics_do_not_report_perfect_first_token_acceptance():
+    assert DVIMetrics(stage="stage_0").first_token_acceptance == 0.0
 
 
 def test_zero_acceptance_rates_are_per_request():
@@ -33,6 +41,67 @@ def test_zero_acceptance_rates_are_per_request():
     assert m.mean_advancement == 1.0
     assert m.first_token_reject_rate == 1.0
     assert m.sampled_per_cycle == 2.0
+
+
+def test_snapshot_exposes_raw_and_derived_per_request_counters():
+    m = DVIMetrics(stage="stage_2")
+    m.record_verification([4, 4, 0], [1, 0, 0], [2, 1, 1])
+    snapshot = m.snapshot()
+    assert snapshot["stage"] == "stage_2"
+    assert snapshot["cycles"] == 1
+    assert snapshot["dvi_reqs"] == 2
+    assert snapshot["dvi_sampled_tokens"] == 3
+    assert snapshot["dvi_first_token_rejects"] == 1
+    assert snapshot["proposed_tokens"] == 8
+    assert snapshot["sampled_hist"] == {1: 1, 2: 1}
+    assert snapshot["accepted_prefix_hist"] == {0: 1, 1: 1}
+    assert snapshot["mean_advancement"] == 1.5
+    assert snapshot["proposal_acceptance"] == 0.125
+    assert snapshot["mean_accepted_prefix_length"] == 0.5
+    assert snapshot["first_token_acceptance"] == 0.5
+    assert snapshot["expected_first_acceptance"] is None
+    assert snapshot["first_token_reject_rate"] == 0.5
+    assert snapshot["cycle_wall_ms_avg"] == 0.0
+    assert snapshot["draft_wall_ms_avg"] == 0.0
+    assert snapshot["verify_wall_ms_avg"] == 0.0
+    assert snapshot["block_serialize_ms_avg"] == 0.0
+    assert snapshot["block_bytes_avg"] == 0.0
+
+
+def test_stochastic_proposal_denominator_excludes_bonus_rows():
+    m = DVIMetrics(stage="stage_2")
+    m.record_verification(
+        [4, 4],
+        [1, 0],
+        [2, 1],
+        proposal_counts=[3, 3],
+        expected_first_acceptances=[0.2, 0.4],
+        first_distribution_diagnostics=[
+            (True, True, 0.6, 0.7),
+            (False, False, 0.8, 0.9),
+        ],
+    )
+    assert m.drafted_tokens == 8
+    assert m.proposed_tokens == 6
+    assert m.mean_acceptance == 0.125
+    assert m.proposal_acceptance == 1 / 6
+    assert m.expected_first_acceptance == 0.30000000000000004
+    assert m.first_target_top1_support_rate == 0.5
+    assert m.first_draft_target_top1_match_rate == 0.5
+    assert m.mean_first_target_top1_probability == 0.7
+    assert m.mean_first_draft_top1_probability == 0.8
+    snapshot = m.snapshot()
+    assert snapshot["first_distribution_samples"] == 2
+    assert snapshot["first_target_top1_in_draft_support"] == 1
+    assert snapshot["first_draft_top1_matches_target"] == 1
+
+
+def test_accepted_prefix_hist_distinguishes_no_bonus_full_acceptance():
+    m = DVIMetrics(stage="stage_2")
+    # Both rows advance four tokens, but only one accepted all four drafts.
+    m.record_verification([4, 4], [3, 4], [4, 4])
+    assert m.sampled_hist == {4: 2}
+    assert m.accepted_prefix_hist == {3: 1, 4: 1}
 
 
 def test_flush_emits_again_after_fallback_only_mutation(monkeypatch):

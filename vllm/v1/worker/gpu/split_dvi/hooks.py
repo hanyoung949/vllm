@@ -54,6 +54,15 @@ class DVIStage2TelemetryHook:
     def make_record_key(self, request_id: str, position: int) -> DVIRecordKey:
         return self.producer.make_record_key(request_id, position)
 
+    @property
+    def evaluation_mode(self) -> bool:
+        return self.producer.evaluation_mode
+
+    def capture_evaluation_rows(self, records: list[dict[str, Any]]) -> bool:
+        if not self.enabled or not self.evaluation_mode:
+            return False
+        return self.producer.capture_evaluation_rows(records)
+
     def reserve(self, key: DVIRecordKey) -> Any | None:
         """Return a ticket if this position should capture verifier data."""
         if not self.enabled:
@@ -193,6 +202,19 @@ class DVIStage0TelemetryProbe:
         self._reserved_count = 0
         self._submitted_count = 0
         self._skipped_count = 0
+
+    @property
+    def evaluation_mode(self) -> bool:
+        return self.producer.evaluation_mode
+
+    def capture_evaluation_block(
+        self,
+        records: list[dict[str, Any]],
+        hidden_rows: list[torch.Tensor],
+    ) -> bool:
+        if not self.enabled or not self.evaluation_mode:
+            return False
+        return self.producer.capture_evaluation_block(records, hidden_rows)
 
     @property
     def session_key(self) -> DVISessionKey:

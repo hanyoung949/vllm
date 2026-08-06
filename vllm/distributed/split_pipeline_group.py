@@ -318,6 +318,9 @@ class SplitPipelineGroup:
             packet_kind=dvi_metadata.get("packet_kind", "normal")
             if dvi_metadata
             else "normal",
+            is_fallback=bool(dvi_metadata.get("is_fallback", False))
+            if dvi_metadata
+            else False,
             cycle_ids=dvi_metadata.get("cycle_ids") if dvi_metadata else None,
             draft_token_ids=dvi_metadata.get("draft_token_ids")
             if dvi_metadata
@@ -335,6 +338,18 @@ class SplitPipelineGroup:
             if dvi_metadata
             else None,
             draft_version=dvi_metadata.get("draft_version")
+            if dvi_metadata
+            else None,
+            sampling_mode=dvi_metadata.get("sampling_mode")
+            if dvi_metadata
+            else None,
+            draft_support_offsets=dvi_metadata.get("draft_support_offsets")
+            if dvi_metadata
+            else None,
+            draft_support_token_ids=dvi_metadata.get("draft_support_token_ids")
+            if dvi_metadata
+            else None,
+            draft_support_logits=dvi_metadata.get("draft_support_logits")
             if dvi_metadata
             else None,
         )
@@ -409,6 +424,7 @@ class SplitPipelineGroup:
             "is_prompt": packet.is_prompt,
             "dvi": {
                 "packet_kind": packet.packet_kind,
+                "is_fallback": packet.is_fallback,
                 "cycle_ids": packet.cycle_ids,
                 "draft_token_ids": packet.draft_token_ids,
                 "draft_lengths": packet.draft_lengths,
@@ -416,6 +432,10 @@ class SplitPipelineGroup:
                 "draft_positions": packet.draft_positions,
                 "policy_version": packet.policy_version,
                 "draft_version": packet.draft_version,
+                "sampling_mode": packet.sampling_mode,
+                "draft_support_offsets": packet.draft_support_offsets,
+                "draft_support_token_ids": packet.draft_support_token_ids,
+                "draft_support_logits": packet.draft_support_logits,
             }
             if packet.is_dvi_block
             else None,

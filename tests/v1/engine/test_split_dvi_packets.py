@@ -73,6 +73,55 @@ def test_dvi_block_version_round_trip():
     assert decoded.draft_version == "draft_v3"
 
 
+def test_fallback_flag_round_trip():
+    packet = _dvi_tensor_packet(num_reqs=1, k=2)
+    packet.is_fallback = True
+    decoded = SplitTensorPacket.deserialize(packet.serialize())
+    assert decoded.is_fallback is True
+    decoded.validate(vocab_size=100, max_draft_length=8)
+
+
+def test_stochastic_dvi_support_round_trip():
+    packet = _dvi_tensor_packet(num_reqs=1, k=2)
+    packet.sampling_mode = "stochastic"
+    packet.draft_support_offsets = [0, 2, 4]
+    packet.draft_support_token_ids = [1, 2, 3, 4]
+    packet.draft_support_logits = [2.0, 1.0, 3.0, -1.0]
+    packet.validate(vocab_size=100, max_draft_length=8)
+    decoded = SplitTensorPacket.deserialize(packet.serialize())
+    assert decoded.sampling_mode == "stochastic"
+    assert decoded.draft_support_offsets == [0, 2, 4]
+    assert decoded.draft_support_token_ids == [1, 2, 3, 4]
+    assert decoded.draft_support_logits == [2.0, 1.0, 3.0, -1.0]
+    decoded.validate(vocab_size=100, max_draft_length=8)
+
+
+@pytest.mark.parametrize(
+    "field,value,match",
+    [
+        ("draft_support_offsets", [0, 2], "offsets length"),
+        ("draft_support_offsets", [1, 2, 4], "start at zero"),
+        ("draft_support_offsets", [0, 2, 2], "strictly increasing"),
+        ("draft_support_token_ids", [1, 2, 3], "offset terminus"),
+        ("draft_support_logits", [1.0, 2.0, 3.0], "length mismatch"),
+        (
+            "draft_support_logits",
+            [1.0, 2.0, 3.0, float("nan")],
+            "must all be finite",
+        ),
+    ],
+)
+def test_stochastic_dvi_support_validation(field, value, match):
+    packet = _dvi_tensor_packet(num_reqs=1, k=2)
+    packet.sampling_mode = "stochastic"
+    packet.draft_support_offsets = [0, 2, 4]
+    packet.draft_support_token_ids = [1, 2, 3, 4]
+    packet.draft_support_logits = [2.0, 1.0, 3.0, -1.0]
+    setattr(packet, field, value)
+    with pytest.raises(SplitDVIProtocolError, match=match):
+        packet.validate(vocab_size=100, max_draft_length=8)
+
+
 def test_normal_packet_round_trip_and_no_dvi_fields():
     packet = SplitTensorPacket(
         req_ids=["a"],
@@ -93,6 +142,7 @@ def test_normal_packet_round_trip_and_no_dvi_fields():
             num_scheduled_tokens=[1],
             is_prompt=False,
             generation_ids=[0],
+            is_fallback=True,
         ).validate()
 
 

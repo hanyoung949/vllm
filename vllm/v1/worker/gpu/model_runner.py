@@ -1613,7 +1613,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if not self.is_last_pp_rank:
             # Non-last PP rank: return IntermediateTensors for sending.
-            self._capture_stage0_boundary(input_batch, output_intermediate_tensors)
+            self._capture_stage0_boundary(
+                input_batch, output_intermediate_tensors, dvi_step_kind
+            )
             return output_intermediate_tensors
         return None
 
@@ -1621,27 +1623,128 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self,
         input_batch: InputBatch,
         intermediate_tensors: IntermediateTensors,
+        dvi_step_kind: DVIStepKind | None = None,
     ) -> None:
         """L0 stage_0 hidden capture through the bounded async handoff.
 
         Captures the boundary hidden row for every sampled position using the
         same response-relative position formula as the stage_2 verifier
         (``num_computed + num_scheduled - prefill_len``), so both stages emit
-        identical record keys.  Skipped for speculative-decode steps (L0
-        telemetry covers plain greedy decode only).
+        identical record keys. For a DVI draft step, only the first boundary
+        row per request is captured: it is always on the committed trajectory,
+        while later rows may depend on proposals that are subsequently
+        rejected. Fallback speculative rows remain excluded.
         """
         probe = self.dvi_stage0_probe
         if probe is None or not probe.enabled:
             return
-        if input_batch.num_draft_tokens > 0:
+        if dvi_step_kind is DVIStepKind.FALLBACK:
             return
         hidden = intermediate_tensors.tensors.get("hidden_states")
         if hidden is None:
             return
-        logits_indices = input_batch.logits_indices
         num_computed = input_batch.num_computed_tokens_np
-        num_scheduled = input_batch.num_scheduled_tokens
         prefill_len = input_batch.prefill_len_np
+        if dvi_step_kind is DVIStepKind.DRAFT:
+            draft_per_req = input_batch.num_draft_tokens_per_req
+            if draft_per_req is None:
+                raise ValueError("DVI draft capture requires per-request lengths")
+            metadata = self.split_dvi_runtime.peek_outgoing_metadata()
+            if metadata is None or metadata.get("packet_kind") != "dvi_block":
+                raise ValueError("DVI draft capture requires outgoing block metadata")
+            draft_positions = metadata.get("draft_positions")
+            if not isinstance(draft_positions, list):
+                raise ValueError("DVI draft capture requires exact draft positions")
+            if probe.evaluation_mode:
+                support_offsets = metadata.get("draft_support_offsets")
+                support_ids = metadata.get("draft_support_token_ids")
+                support_logits = metadata.get("draft_support_logits")
+                if not isinstance(support_offsets, list):
+                    support_offsets = None
+                if not isinstance(support_ids, list):
+                    support_ids = None
+                if not isinstance(support_logits, list):
+                    support_logits = None
+                records: list[dict[str, Any]] = []
+                hidden_rows: list[torch.Tensor] = []
+                row_cursor = 0
+                proposal_cursor = 0
+                for req_idx, req_id in enumerate(input_batch.req_ids):
+                    draft_len = int(metadata["draft_lengths"][req_idx])
+                    num_proposals = max(0, draft_len - 1)
+                    for row_index in range(draft_len):
+                        response_pos = (
+                            int(draft_positions[row_cursor + row_index])
+                            + 1
+                            - int(prefill_len[req_idx])
+                        )
+                        is_proposal = row_index < num_proposals
+                        record: dict[str, Any] = {
+                            "request_id": req_id,
+                            "cycle_id": int(metadata["cycle_ids"][req_idx]),
+                            "generation_id": int(
+                                metadata["generation_ids"][req_idx]
+                            ),
+                            "row_index": row_index,
+                            "absolute_position": response_pos,
+                            "row_kind": "proposal" if is_proposal else "bonus",
+                            "num_proposals": num_proposals,
+                            "draft_token_id": (
+                                int(
+                                    metadata["draft_token_ids"][
+                                        proposal_cursor + row_index
+                                    ]
+                                )
+                                if is_proposal
+                                else None
+                            ),
+                            "draft_support_token_ids": [],
+                            "draft_support_logits": [],
+                        }
+                        if (
+                            is_proposal
+                            and support_offsets is not None
+                            and support_ids is not None
+                            and support_logits is not None
+                        ):
+                            start = int(support_offsets[proposal_cursor + row_index])
+                            end = int(
+                                support_offsets[proposal_cursor + row_index + 1]
+                            )
+                            record["draft_support_token_ids"] = [
+                                int(value) for value in support_ids[start:end]
+                            ]
+                            record["draft_support_logits"] = [
+                                float(value) for value in support_logits[start:end]
+                            ]
+                        records.append(record)
+                        hidden_rows.append(hidden[row_cursor + row_index])
+                    row_cursor += draft_len
+                    proposal_cursor += draft_len
+                if row_cursor != hidden.shape[0]:
+                    raise ValueError(
+                        "DVI evaluation rows do not match intermediate tensor rows: "
+                        f"expected={row_cursor} actual={hidden.shape[0]}"
+                    )
+                probe.capture_evaluation_block(records, hidden_rows)
+                return
+            row_offset = 0
+            for i, req_id in enumerate(input_batch.req_ids):
+                response_pos = int(draft_positions[row_offset]) + 1 - int(
+                    prefill_len[i]
+                )
+                if response_pos >= 0:
+                    probe.capture(req_id, response_pos, hidden[row_offset])
+                row_offset += int(draft_per_req[i]) + 1
+            if row_offset != hidden.shape[0]:
+                raise ValueError(
+                    "DVI boundary rows do not match intermediate tensor rows: "
+                    f"expected={row_offset} actual={hidden.shape[0]}"
+                )
+            return
+
+        logits_indices = input_batch.logits_indices
+        num_scheduled = input_batch.num_scheduled_tokens
         for i, req_id in enumerate(input_batch.req_ids):
             response_pos = (
                 int(num_computed[i])
